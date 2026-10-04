@@ -1,0 +1,46 @@
+import { Button } from "@/components/ui/button";
+import { Badge } from "@/components/ui/badge";
+
+type OrderStatusFilter = 'current' | 'all' | 'pending' | 'preparing' | 'ready' | 'completed';
+
+interface StatusFiltersProps {
+  statusFilter: OrderStatusFilter;
+  onFilterChange: (status: OrderStatusFilter) => void;
+  statusCounts: Record<OrderStatusFilter, number>;
+}
+
+const StatusFilters = ({ statusFilter, onFilterChange, statusCounts }: StatusFiltersProps) => {
+  const statusOptions: { key: OrderStatusFilter; label: string; count: number; color: string }[] = [
+    { key: 'current', label: 'Current', count: statusCounts.current, color: 'bg-orange-100 text-orange-800' },
+    { key: 'all', label: 'All', count: statusCounts.all, color: 'bg-muted text-foreground' },
+    { key: 'pending', label: 'Pending', count: statusCounts.pending, color: 'bg-yellow-100 text-yellow-800' },
+    { key: 'preparing', label: 'Preparing', count: statusCounts.preparing, color: 'bg-blue-100 text-blue-800' },
+    { key: 'ready', label: 'Ready', count: statusCounts.ready, color: 'bg-green-100 text-green-800' },
+    { key: 'completed', label: 'Completed', count: statusCounts.completed, color: 'bg-muted text-foreground' },
+  ];
+
+  return (
+    <div className="flex flex-wrap gap-2">
+      {statusOptions.map((status) => (
+        <Button
+          key={status.key}
+          variant={statusFilter === status.key ? "default" : "outline"}
+          size="sm"
+          onClick={() => onFilterChange(status.key)}
+          className={`whitespace-nowrap h-10 px-4 ${
+            statusFilter === status.key
+              ? 'beepbite-gradient text-white'
+              : 'hover:bg-muted'
+          }`}
+        >
+          <span className="font-medium">{status.label}</span>
+          <Badge variant="secondary" className="ml-2 text-xs">
+            {status.count}
+          </Badge>
+        </Button>
+      ))}
+    </div>
+  );
+};
+
+export default StatusFilters; 

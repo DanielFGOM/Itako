@@ -1,0 +1,137 @@
+// Package kdsfanout contains the background runner that drains the
+// kds_fanout_queue table and calls kds.Store.FanoutOrder for each pending row.
+package kdsfanout
+
+import (
+	"context"
+	"errors"
+	"log"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	internaldb "github.com/beepbite/backend/internal/db"
+	"github.com/beepbite/backend/internal/handlers/kds"
+)
+
+const (
+	// tickInterval controls how often the runner polls kds_fanout_queue.
+	tickInterval = 5 * time.Second
+
+	// batchSize is the maximum number of queue rows processed per tick.
+	batchSize = 100
+)
+
+// Runner polls kds_fanout_queue every 5 seconds and fans out pending orders
+// to the KDS using kds.Store.FanoutOrderTx.
+type Runner struct {
+	db       *pgxpool.Pool
+	kdsStore *kds.Store
+}
+
+// NewRunner constructs a Runner. Both db and kdsStore are required.
+func NewRunner(db *pgxpool.Pool, kdsStore *kds.Store) *Runner {
+	return &Runner{db: db, kdsStore: kdsStore}
+}
+
+// Start launches the background polling loop in a goroutine.  The loop ticks
+// every 5 seconds and calls RunOnce.  It exits cleanly when ctx is cancelled.
+func (r *Runner) Start(ctx context.Context) {
+	go func() {
+		ticker := time.NewTicker(tickInterval)
+		defer ticker.Stop()
+
+		// Run immediately on start so we don't wait one full interval.
+		if err := r.RunOnce(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			log.Printf("kdsfanout: RunOnce error: %v", err)
+		}
+
+		for {
+			select {
+			case <-ctx.Done():
+				log.Println("kdsfanout: Runner shutting down")
+				return
+			case <-ticker.C:
+				if err := r.RunOnce(ctx); err != nil && !errors.Is(err, context.Canceled) {
+					log.Printf("kdsfanout: RunOnce error: %v", err)
+				}
+			}
+		}
+	}()
+}
+
+// RunOnce processes up to batchSize pending rows from kds_fanout_queue
+// (state='pending' AND retry_count < maxRetries).
+//
+// All DB work runs inside a service-role transaction so that RLS policies
+// on kds_fanout_queue (which require is_service_role()) are satisfied.
+//
+// On fanout success  → DELETE the row (order is fully routed).
+// On fanout failure  → increment retry_count; if retry_count reaches maxRetries
+//
+//	set state='dead' and emit a single error log.
+//
+// Dead rows are never selected again, so log spam is bounded to one line.
+func (r *Runner) RunOnce(ctx context.Context) error {
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+
+	// Load pending rows under service-role scope.
+	var pending []queueRow
+	if err := internaldb.Scoped(ctx, r.db, internaldb.ServiceRoleScope(), func(tx pgx.Tx) error {
+		var err error
+		pending, err = loadPending(ctx, tx, batchSize)
+		return err
+	}); err != nil {
+		return err
+	}
+
+	for _, row := range pending {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+
+		// Fan out the order inside a service-role transaction so KDS tables
+		// (kds_tickets, kds_ticket_items, orders, item_station_routing) are
+		// accessible without a tenant identity.
+		var fanErr error
+		err := internaldb.Scoped(ctx, r.db, internaldb.ServiceRoleScope(), func(tx pgx.Tx) error {
+			_, fanErr = r.kdsStore.FanoutOrderTx(ctx, tx, row.OrderID)
+			return nil // don't roll back the outer scope on fanout failure
+		})
+		if err != nil {
+			log.Printf("kdsfanout: scoped tx for order=%s queue=%s: %v", row.OrderID, row.ID, err)
+			continue
+		}
+
+		if fanErr != nil {
+			// Fanout itself failed — record the retry / dead transition.
+			markErr := internaldb.Scoped(ctx, r.db, internaldb.ServiceRoleScope(), func(tx pgx.Tx) error {
+				dead, mErr := markRetry(ctx, tx, row.ID, fanErr.Error(), row.RetryCount)
+				if mErr != nil {
+					return mErr
+				}
+				// Log only when the row transitions to dead — avoids per-retry spam.
+				if dead {
+					log.Printf("kdsfanout: order=%s queue=%s dead after %d retries; last error: %v",
+						row.OrderID, row.ID, maxRetries, fanErr)
+				}
+				return nil
+			})
+			if markErr != nil {
+				log.Printf("kdsfanout: markRetry queue=%s: %v", row.ID, markErr)
+			}
+			continue
+		}
+
+		if mErr := internaldb.Scoped(ctx, r.db, internaldb.ServiceRoleScope(), func(tx pgx.Tx) error {
+			return markProcessed(ctx, tx, row.ID)
+		}); mErr != nil {
+			log.Printf("kdsfanout: markProcessed queue=%s: %v", row.ID, mErr)
+		}
+	}
+
+	return nil
+}

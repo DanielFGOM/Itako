@@ -1,0 +1,488 @@
+/**
+ * Invoice create / edit form — Wave 34 / Now-26.
+ *
+ * Used for both creating a new invoice (/invoices/new) and editing
+ * an existing draft (/invoices/:id/edit).
+ *
+ * Routes (wire externally in routes.jsx):
+ *   /invoices/new        — create
+ *   /invoices/:id/edit   — edit draft
+ */
+
+import { useState, useEffect, useCallback, useMemo, type FormEvent } from 'react';
+import { useParams, useNavigate } from 'react-router-dom';
+import {
+  Card,
+  CardContent,
+  CardHeader,
+  CardTitle,
+  CardDescription,
+} from '@/components/ui/card';
+import { Button } from '@/components/ui/button';
+import { Input } from '@/components/ui/input';
+import { Label } from '@/components/ui/label';
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select';
+import { Alert, AlertDescription } from '@/components/ui/alert';
+import {
+  ArrowLeft,
+  Loader2,
+  Plus,
+  Trash2,
+  Save,
+  AlertCircle,
+} from 'lucide-react';
+import { getInvoice, createInvoice, updateInvoice } from '@/services/invoicing';
+import { useLocale } from '@/context/locale-context';
+import { formatMoney, currencySymbol } from '@/lib/currency';
+import { currencyOptions } from '@/lib/locale-data';
+
+// ── Constants ─────────────────────────────────────────────────────────────────
+//
+// The currency list comes from src/lib/locale-data.js, which mirrors the
+// backend `currencies` table (there is no endpoint that lists it — see that
+// file's KNOWN GAP note); it is not re-declared here.
+
+interface FormLine {
+  description: string;
+  qty: number;
+  unit_cents: number;
+}
+
+interface InvoiceFormState {
+  issuer: 'platform' | 'tenant';
+  recipient_org_id: string;
+  recipient_customer_id: string;
+  recipient_name: string;
+  recipient_address: string;
+  currency: string;
+  vat_rate_pct: number | string;
+  lines: FormLine[];
+}
+
+const EMPTY_LINE: FormLine = { description: '', qty: 1, unit_cents: 0 };
+
+const EMPTY_FORM: InvoiceFormState = {
+  issuer:                'tenant',
+  recipient_org_id:      '',
+  recipient_customer_id: '',
+  recipient_name:        '',
+  recipient_address:     '',
+  // No hardcoded currency default — an unconfigured location should look
+  // unconfigured, not confidently priced in some country's currency.
+  currency:              '',
+  vat_rate_pct:          0,
+  lines:                 [{ ...EMPTY_LINE }],
+};
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
+
+function centsFromInput(val: string) {
+  const n = parseFloat(val);
+  if (isNaN(n)) return 0;
+  return Math.round(n * 100);
+}
+
+function inputFromCents(cents: number | null | undefined) {
+  if (!cents) return '';
+  return (cents / 100).toFixed(2);
+}
+
+function subtotal(lines: FormLine[]) {
+  return lines.reduce((acc, l) => acc + l.qty * l.unit_cents, 0);
+}
+
+// ── Component ─────────────────────────────────────────────────────────────────
+
+export default function InvoiceFormPage() {
+  const { id } = useParams(); // undefined on /invoices/new
+  const navigate = useNavigate();
+  const isEdit = !!id;
+
+  const { currency: activeCurrency, locale, taxLabel } = useLocale();
+  // The tax is called VAT in the EU/UK/ZA, GST elsewhere, IVA in Spain/Italy/
+  // Latin America, Consumption Tax in Japan and Sales Tax in the US — the
+  // label must come from the location's own configured name, not a hardcode.
+  const tax = taxLabel || 'Tax';
+  // The full option list is rebuilt from Intl.DisplayNames, so it is memoised
+  // against the locale that names it rather than recomputed every render.
+  const currencyChoices = useMemo(() => currencyOptions(locale), [locale]);
+  // fmtCents needs the reader's locale, which only the hook can supply, so it
+  // lives inside the component rather than as a module-level helper.
+  const fmtCents = (cents: number | null | undefined, currency: string) => formatMoney(cents ?? 0, { currency, locale });
+
+  const [form, setForm] = useState<InvoiceFormState>(() => ({ ...EMPTY_FORM, currency: activeCurrency || '' }));
+  const [loading, setLoading] = useState(isEdit);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  // ── Load existing invoice (edit mode) ────────────────────────────────────
+
+  const load = useCallback(async () => {
+    if (!id) return;
+    setLoading(true);
+    // getInvoice() only wraps the API-error case in { data, error } — a
+    // network-level failure (fetch() itself rejecting) propagates as a
+    // rejected promise. Without this try/catch/finally, that left the
+    // invoice edit form stuck on its loading spinner forever.
+    try {
+      const { data, error: err } = await getInvoice(id);
+      if (err) {
+        setError(err.message || 'Failed to load invoice.');
+      } else if (data) {
+        const existingLines = data.lines;
+        setForm({
+          issuer:                data.issuer                ?? 'tenant',
+          recipient_org_id:      data.recipient_org_id      ?? '',
+          recipient_customer_id: data.recipient_customer_id ?? '',
+          recipient_name:        data.recipient_name        ?? '',
+          recipient_address:     data.recipient_address     ?? '',
+          currency:              data.currency              ?? activeCurrency ?? '',
+          vat_rate_pct:          data.vat_rate_percent      ?? 0,
+          lines: (existingLines && existingLines.length > 0)
+            ? existingLines.map((l) => ({
+                description: l.description,
+                qty:         l.qty,
+                unit_cents:  l.unit_cents,
+              }))
+            : [{ ...EMPTY_LINE }],
+        });
+      }
+    } catch (err) {
+      console.error('Error loading invoice:', err);
+      setError('Failed to load invoice.');
+    } finally {
+      setLoading(false);
+    }
+  }, [id, activeCurrency]);
+
+  useEffect(() => { if (isEdit) void load(); }, [isEdit, load]);
+
+  // ── Field helpers ─────────────────────────────────────────────────────────
+
+  function setField<K extends keyof InvoiceFormState>(name: K, value: InvoiceFormState[K]) {
+    setForm((prev) => ({ ...prev, [name]: value }));
+    setError(null);
+  }
+
+  function setLine<K extends keyof FormLine>(idx: number, field: K, value: FormLine[K]) {
+    setForm((prev) => {
+      const lines = [...prev.lines];
+      lines[idx] = { ...lines[idx], [field]: value };
+      return { ...prev, lines };
+    });
+  }
+
+  function addLine() {
+    setForm((prev) => ({ ...prev, lines: [...prev.lines, { ...EMPTY_LINE }] }));
+  }
+
+  function removeLine(idx: number) {
+    setForm((prev) => ({
+      ...prev,
+      lines: prev.lines.filter((_, i) => i !== idx),
+    }));
+  }
+
+  // ── Save ──────────────────────────────────────────────────────────────────
+
+  async function handleSave(e: FormEvent) {
+    e.preventDefault();
+    if (form.lines.length === 0) {
+      setError('Add at least one line item.');
+      return;
+    }
+    setSaving(true);
+    setError(null);
+
+    const { lines, vat_rate_pct, recipient_org_id, recipient_customer_id, ...rest } = form;
+    const body = {
+      ...rest,
+      // Only send recipient IDs when they are non-empty strings.
+      ...(recipient_org_id      ? { recipient_org_id }      : {}),
+      ...(recipient_customer_id ? { recipient_customer_id } : {}),
+      lines,
+      vat_rate_pct: parseFloat(String(vat_rate_pct)) || 0,
+    };
+
+    let result;
+    if (isEdit && id) {
+      result = await updateInvoice(id, body);
+    } else {
+      result = await createInvoice(body);
+    }
+
+    if (result.error || !result.data) {
+      setError(result.error?.message || 'Failed to save invoice.');
+      setSaving(false);
+      return;
+    }
+    // Navigate to the detail page on success.
+    void navigate(`/invoices/${result.data.id}`);
+  }
+
+  // ── Computed ──────────────────────────────────────────────────────────────
+
+  const sub = subtotal(form.lines);
+  const vatCents = Number(form.vat_rate_pct) > 0
+    ? Math.round(sub * parseFloat(String(form.vat_rate_pct)) / 100)
+    : 0;
+  const totalCents = sub + vatCents;
+  const currency = form.currency || activeCurrency || '';
+
+  // ── Render ────────────────────────────────────────────────────────────────
+
+  if (loading) {
+    return (
+      <div className="flex items-center justify-center h-48">
+        <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />
+      </div>
+    );
+  }
+
+  return (
+    <div className="max-w-3xl mx-auto px-4 py-6 space-y-6">
+      {/* Back + title */}
+      <div className="flex items-center gap-3">
+        <Button variant="ghost" size="icon" onClick={() => navigate('/invoices')}>
+          <ArrowLeft className="h-4 w-4" />
+        </Button>
+        <h1 className="text-xl font-semibold">
+          {isEdit ? 'Edit invoice' : 'New invoice'}
+        </h1>
+      </div>
+
+      {/* Error */}
+      {error && (
+        <Alert variant="destructive">
+          <AlertCircle className="h-4 w-4" />
+          <AlertDescription>{error}</AlertDescription>
+        </Alert>
+      )}
+
+      <form onSubmit={handleSave} className="space-y-6">
+        {/* Header fields */}
+        <Card>
+          <CardHeader>
+            <CardTitle className="text-base">Invoice details</CardTitle>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            {/* Issuer */}
+            <div className="space-y-1">
+              <Label>Issuer</Label>
+              <Select
+                value={form.issuer}
+                onValueChange={(v) => setField('issuer', v as 'platform' | 'tenant')}
+                disabled={isEdit}
+              >
+                <SelectTrigger>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="tenant">My business (tenant)</SelectItem>
+                  <SelectItem value="platform">BeepBite platform</SelectItem>
+                </SelectContent>
+              </Select>
+              <p className="text-xs text-muted-foreground">
+                Choose "My business" to invoice your customers. {tax} is applied
+                automatically if your {tax} number is set in Business Info.
+              </p>
+            </div>
+
+            {/* Currency */}
+            <div className="space-y-1">
+              <Label>Currency</Label>
+              <Select
+                value={form.currency}
+                onValueChange={(v) => setField('currency', v)}
+              >
+                <SelectTrigger>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {currencyChoices.map(({ code }) => (
+                    <SelectItem key={code} value={code}>
+                      {code} {currencySymbol(code, locale)}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+
+            {/* Tax rate */}
+            <div className="space-y-1">
+              <Label htmlFor="vat_rate_pct">
+                {tax} rate %{' '}
+                <span className="text-muted-foreground text-xs">
+                  (applied automatically when {tax} number is set in Business Info)
+                </span>
+              </Label>
+              <Input
+                id="vat_rate_pct"
+                type="number"
+                min="0"
+                max="100"
+                step="0.5"
+                value={form.vat_rate_pct}
+                onChange={(e) => setField('vat_rate_pct', e.target.value)}
+                placeholder="15"
+                className="max-w-[120px]"
+              />
+            </div>
+          </CardContent>
+        </Card>
+
+        {/* Recipient */}
+        <Card>
+          <CardHeader>
+            <CardTitle className="text-base">Bill To</CardTitle>
+            <CardDescription>Your customer's billing details.</CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            {/* Recipient org ID — required for tenant-issued invoices */}
+            {form.issuer === 'tenant' && (
+              <div className="space-y-1">
+                <Label htmlFor="recipient_org_id">
+                  Recipient org ID{' '}
+                  <span className="text-destructive text-xs">*</span>
+                  {' '}
+                  <span className="text-muted-foreground text-xs">
+                    (required — the organisation being billed)
+                  </span>
+                </Label>
+                <Input
+                  id="recipient_org_id"
+                  value={form.recipient_org_id}
+                  onChange={(e) => setField('recipient_org_id', e.target.value)}
+                  placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+                  required
+                />
+              </div>
+            )}
+            <div className="space-y-1">
+              <Label htmlFor="recipient_name">Recipient name</Label>
+              <Input
+                id="recipient_name"
+                value={form.recipient_name}
+                onChange={(e) => setField('recipient_name', e.target.value)}
+                placeholder="Acme Corp"
+                required
+              />
+            </div>
+            <div className="space-y-1">
+              <Label htmlFor="recipient_address">Recipient address</Label>
+              <Input
+                id="recipient_address"
+                value={form.recipient_address}
+                onChange={(e) => setField('recipient_address', e.target.value)}
+                placeholder="456 Business Ave, Johannesburg, 2000"
+              />
+            </div>
+          </CardContent>
+        </Card>
+
+        {/* Line items */}
+        <Card>
+          <CardHeader>
+            <CardTitle className="text-base">Line Items</CardTitle>
+          </CardHeader>
+          <CardContent className="space-y-3">
+            {/* Header row */}
+            <div className="grid grid-cols-[1fr_80px_110px_32px] gap-2 text-xs text-muted-foreground">
+              <span>Description</span>
+              <span className="text-center">Qty</span>
+              <span className="text-right">Unit price</span>
+              <span />
+            </div>
+
+            {form.lines.map((line, idx) => (
+              <div key={idx} className="grid grid-cols-[1fr_80px_110px_32px] gap-2 items-center">
+                <Input
+                  value={line.description}
+                  onChange={(e) => setLine(idx, 'description', e.target.value)}
+                  placeholder="Service description"
+                  required
+                />
+                <Input
+                  type="number"
+                  min="1"
+                  step="1"
+                  value={line.qty}
+                  onChange={(e) => setLine(idx, 'qty', parseInt(e.target.value) || 1)}
+                  className="text-center"
+                />
+                <Input
+                  type="number"
+                  min="0"
+                  step="0.01"
+                  value={inputFromCents(line.unit_cents)}
+                  onChange={(e) => setLine(idx, 'unit_cents', centsFromInput(e.target.value))}
+                  placeholder="0.00"
+                  className="text-right"
+                />
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon"
+                  disabled={form.lines.length === 1}
+                  onClick={() => removeLine(idx)}
+                  className="text-muted-foreground hover:text-destructive"
+                >
+                  <Trash2 className="h-4 w-4" />
+                </Button>
+              </div>
+            ))}
+
+            <Button type="button" variant="outline" size="sm" onClick={addLine}>
+              <Plus className="mr-1 h-4 w-4" />
+              Add line
+            </Button>
+
+            {/* Totals summary */}
+            <div className="border-t pt-3 space-y-1 text-sm">
+              <div className="flex justify-between text-muted-foreground">
+                <span>Subtotal</span>
+                <span className="tabular-nums">{fmtCents(sub, currency)}</span>
+              </div>
+              {vatCents > 0 && (
+                <div className="flex justify-between text-muted-foreground">
+                  <span>{tax} ({form.vat_rate_pct}%)</span>
+                  <span className="tabular-nums">{fmtCents(vatCents, currency)}</span>
+                </div>
+              )}
+              <div className="flex justify-between font-semibold text-base border-t pt-1">
+                <span>Total</span>
+                <span className="tabular-nums">{fmtCents(totalCents, currency)}</span>
+              </div>
+            </div>
+          </CardContent>
+        </Card>
+
+        {/* Submit */}
+        <div className="flex justify-end gap-3">
+          <Button type="button" variant="outline" onClick={() => navigate('/invoices')}>
+            Cancel
+          </Button>
+          <Button type="submit" disabled={saving}>
+            {saving ? (
+              <>
+                <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                Saving…
+              </>
+            ) : (
+              <>
+                <Save className="mr-2 h-4 w-4" />
+                {isEdit ? 'Save changes' : 'Create invoice'}
+              </>
+            )}
+          </Button>
+        </div>
+      </form>
+    </div>
+  );
+}

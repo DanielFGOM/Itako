@@ -1,0 +1,53 @@
+node_modules
+
+.venv
+
+dist
+dev-dist
+
+billingmodel/results/
+billingmodel/__pycache__/
+
+.firebase
+
+# Env files — commit only the .example sibling. Matched by prefix (not the
+# four exact names this used to list) so a renamed/backed-up copy — e.g. an
+# agent doing `mv .env .env.bak-sweep` to run a gate that needs .env absent —
+# is still covered instead of showing up as an untracked, unignored file that
+# a later `git add` could commit. .env.example is the one deliberately
+# tracked sibling and is re-included below.
+.env
+.env.*
+# `.env.*` needs a literal dot, so vim/emacs tilde backups (.env~, .env.local~)
+# slipped through as untracked-but-unignored files a `git add .` would commit.
+# Editing .env over SSH with vim's default backup setting is exactly how a
+# self-hosting operator produces one.
+*.env~
+.env*~
+!.env.example
+
+# Go build artifacts
+backend/bin/
+backend/tmp/
+backend/beepbite-server-local
+backend/beepbite-server-*
+
+# Local workspace for the -tags patala build (see backend/Makefile's go.work
+# target). Wires the sibling patala-go module in for local cgo dev/test only
+# — never committed, and never needed by the default backend build.
+backend/go.work
+backend/go.work.sum
+
+.vscode
+
+playwright-report
+# Playwright test artifacts
+test-results/
+
+# agent tooling
+.agents/
+.claude/
+
+# Mongo backend build artifacts
+mongo-backend/itako-server
+mongo-backend/bin/

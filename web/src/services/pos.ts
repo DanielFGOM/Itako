@@ -1,0 +1,419 @@
+// POS service helpers — thin wrappers around backend endpoints used by the
+// cashier-facing pages. Keeping these centralised so screens don't reimplement
+// fetch + error handling for the same routes.
+
+import { api } from '@/lib/api-client';
+
+const STORAGE_KEY = 'bb.auth';
+const REGISTER_SESSION_KEY = 'pos.register_session_id';
+const REGISTER_DRAWER_KEY = 'pos.register_drawer_id';
+const REGISTER_OPENED_AT_KEY = 'pos.register_opened_at';
+
+export interface StaffRecord {
+  id: string;
+  first_name?: string;
+  last_name?: string;
+  username?: string;
+  role?: string;
+  location_id?: string;
+  capabilities?: string[] | Record<string, boolean>;
+  [key: string]: unknown;
+}
+
+export interface StaffSession {
+  staff?: StaffRecord;
+  access_token?: string;
+  capabilities?: string[] | Record<string, boolean>;
+  [key: string]: unknown;
+}
+
+// ---- Staff session helpers --------------------------------------------------
+
+/**
+ * Read the currently-logged-in staff session from localStorage.
+ * The staff PIN/password login persists this under `bb.auth`.
+ * Returns shape: { staff: { id, first_name, last_name, role, location_id }, access_token, ... }
+ */
+export function readStaffSession(): StaffSession | null {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (!raw) return null;
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Convenience: extract just the staff record (or null).
+ */
+export function getStaff(): StaffRecord | null {
+  const session = readStaffSession();
+  return session?.staff || null;
+}
+
+/**
+ * Check if the currently-logged-in staff has a named capability.
+ *
+ * The staff session JWT carries capabilities as a string array, e.g.
+ *   ["can_void", "can_settle", "can_comp"]
+ *
+ * Owners/admins using a Supabase email session (no bb.auth staff record) are
+ * granted all capabilities.
+ */
+export function hasCapability(name: string): boolean {
+  const session = readStaffSession();
+  // No staff session at all means an owner/admin Supabase login — full access.
+  if (!session) return true;
+  const caps = session.capabilities || session.staff?.capabilities || [];
+  // Support both array form (new actor-overlay tokens) and legacy object form
+  if (Array.isArray(caps)) return caps.includes(name);
+  if (typeof caps === 'object') return caps[name] === true;
+  return false;
+}
+
+/**
+ * Convenience: return a display name for the staff member.
+ */
+export function getStaffDisplayName(): string {
+  const staff = getStaff();
+  if (!staff) return '';
+  const first = staff.first_name || '';
+  const last = staff.last_name || '';
+  const full = `${first} ${last}`.trim();
+  return full || staff.username || staff.id || '';
+}
+
+// ---- Register-session persistence ------------------------------------------
+
+export interface StoredRegister {
+  sessionId: string | null;
+  drawerId: string | null;
+  openedAt: string | null;
+}
+
+export function readStoredRegister(): StoredRegister | null {
+  try {
+    const sessionId = localStorage.getItem(REGISTER_SESSION_KEY) || null;
+    const drawerId = localStorage.getItem(REGISTER_DRAWER_KEY) || null;
+    const openedAt = localStorage.getItem(REGISTER_OPENED_AT_KEY) || null;
+    if (!sessionId) return null;
+    return { sessionId, drawerId, openedAt };
+  } catch {
+    return null;
+  }
+}
+
+export function persistRegister({ sessionId, drawerId, openedAt }: StoredRegister) {
+  try {
+    if (sessionId) localStorage.setItem(REGISTER_SESSION_KEY, sessionId);
+    else localStorage.removeItem(REGISTER_SESSION_KEY);
+    if (drawerId) localStorage.setItem(REGISTER_DRAWER_KEY, drawerId);
+    else localStorage.removeItem(REGISTER_DRAWER_KEY);
+    if (openedAt) localStorage.setItem(REGISTER_OPENED_AT_KEY, openedAt);
+    else localStorage.removeItem(REGISTER_OPENED_AT_KEY);
+  } catch {
+    // ignore quota errors — register-session ID will simply re-prompt on refresh.
+  }
+}
+
+export function clearStoredRegister() {
+  persistRegister({ sessionId: null, drawerId: null, openedAt: null });
+}
+
+// Mirrors backend/migrations/001_baseline.sql public.cash_drawers.
+export interface CashDrawer {
+  id: string;
+  location_id: string;
+  name: string;
+  is_active: boolean;
+  created_at: string;
+  updated_at: string;
+  [key: string]: unknown;
+}
+
+// Mirrors backend/migrations/001_baseline.sql public.cash_drawer_sessions.
+export interface CashDrawerSession {
+  id: string;
+  cash_drawer_id: string;
+  opened_by: string | null;
+  closed_by: string | null;
+  opening_float_cents: number;
+  declared_closing_cents: number | null;
+  expected_closing_cents: number | null;
+  over_short_cents: number | null;
+  is_blind_close: boolean;
+  status: string;
+  opened_at: string;
+  closed_at: string | null;
+  notes: string | null;
+  created_at: string;
+  [key: string]: unknown;
+}
+
+// ---- Cash drawer / register-session API ------------------------------------
+
+/**
+ * List active drawers for a location.
+ */
+export async function listDrawers(locationId: string): Promise<CashDrawer[]> {
+  if (!locationId) return [];
+  const { data } = await api.request(
+    'GET',
+    `/data/cash_drawers?eq=location_id,${encodeURIComponent(locationId)}&eq=is_active,true`,
+  );
+  return Array.isArray(data) ? data : [];
+}
+
+/**
+ * Fetch the open session (if any) for a drawer.
+ * Backend route: GET /cash-drawers/{drawer_id}/sessions?status=open
+ */
+export async function getOpenSession(drawerId: string): Promise<CashDrawerSession | null> {
+  if (!drawerId) return null;
+  const { data, error } = await api.request(
+    'GET',
+    `/cash-drawers/${encodeURIComponent(drawerId)}/sessions?status=open`,
+  );
+  if (error) throw new Error(error.message || 'Failed to fetch session');
+  const sessions = Array.isArray(data) ? data : data ? [data] : [];
+  return sessions[0] || null;
+}
+
+/**
+ * Open a session on a drawer. denominations is a {key: count} map from the
+ * DenominationGrid component.
+ */
+export async function openRegisterSession({
+  drawerId,
+  openingFloatCents,
+  openedByStaffId,
+  denominations,
+  isBlindClose = false,
+  note = '',
+}: {
+  drawerId: string;
+  openingFloatCents: number;
+  openedByStaffId?: string;
+  denominations?: Record<string, number>;
+  isBlindClose?: boolean;
+  note?: string;
+}): Promise<CashDrawerSession> {
+  if (!drawerId) throw new Error('drawerId required');
+  // Response mirrors backend/internal/handlers/cashdrawer/store.go Session —
+  // same shape as CashDrawerSession above (the handler writeJSON()s the row
+  // straight from OpenSession()).
+  const { data, error } = await api.request<CashDrawerSession>(
+    'POST',
+    `/cash-drawers/${encodeURIComponent(drawerId)}/sessions/open`,
+    {
+      body: {
+        opening_float_cents: openingFloatCents,
+        opened_by_staff_id: openedByStaffId || '',
+        is_blind_close: isBlindClose,
+        denominations: denominations || {},
+        notes: note || undefined,
+      },
+    },
+  );
+  if (error) throw new Error(error.message || 'Failed to open register');
+  return data!;
+}
+
+// ---- POS order checkout -----------------------------------------------------
+
+/**
+ * Submit a cart as a POS order. Contract:
+ *   POST /pos/orders
+ *   { location_id, order_type, table_number?, register_session_id, items: [...] }
+ *   response: { order_id, order_number, total, kds_ticket_ids: [] }
+ */
+interface FetchError extends Error {
+  status?: number;
+}
+
+// Mirrors backend/internal/handlers/pos/store.go CreatedOrder (returned by
+// POST /pos/orders and shaped identically by /pos/orders/{id}/charge's
+// underlying store call). *_minor fields are exact integer minor units;
+// subtotal/tax/gratuity/total are float major-unit compatibility fields.
+export interface CreatedOrder {
+  order_id: string;
+  order_number: string;
+  subtotal_minor: number;
+  tax_minor: number;
+  gratuity_minor: number;
+  total_minor: number;
+  delivery_fee_minor?: number;
+  subtotal: number;
+  tax: number;
+  gratuity: number;
+  total: number;
+  delivery_fee?: number;
+  currency_code: string;
+  currency_decimals: number;
+  tax_rate: number;
+  tax_inclusive: boolean;
+  tax_label: string;
+  kds_ticket_ids: string[];
+  status: string;
+  payment_method: string;
+}
+
+export async function submitPosOrder({
+  locationId,
+  orderType = 'dine_in',
+  tableNumber,
+  registerSessionId,
+  items,
+  notes,
+  onDeliveryMethod,
+}: {
+  locationId: string;
+  orderType?: string;
+  tableNumber?: string;
+  registerSessionId?: string;
+  items: unknown[];
+  notes?: string;
+  onDeliveryMethod?: string;
+}): Promise<CreatedOrder> {
+  const body: {
+    location_id: string;
+    order_type: string;
+    register_session_id?: string;
+    items: unknown[];
+    table_number?: string;
+    notes?: string;
+    on_delivery_method?: string;
+  } = {
+    location_id: locationId,
+    order_type: orderType,
+    register_session_id: registerSessionId,
+    items,
+    on_delivery_method: onDeliveryMethod,
+  };
+  if (tableNumber) body.table_number = tableNumber;
+  if (notes) body.notes = notes;
+
+  const { data, error } = await api.request<CreatedOrder>('POST', '/pos/orders', { body });
+  if (error) {
+    const e: FetchError = new Error(error.message || 'No se pudo guardar el pedido.');
+    e.status = error.status;
+    throw e;
+  }
+  return data!;
+}
+
+// ---- Order modification (Wave 24) ------------------------------------------
+
+/**
+ * Replace the full set of line items on an order that has not yet been
+ * accepted by the kitchen (no KDS ticket past 'fired').
+ *
+ * Contract:
+ *   PATCH /pos/orders/{orderId}/items
+ *   { items: [{ item_id, quantity, modifiers?, course_id?, notes? }, ...] }
+ *   200 → { order_id, subtotal, tax, total, currency_code, kds_ticket_ids }
+ *   409 → order already in preparation, cannot modify
+ *
+ */
+export interface ModifyOrderItem {
+  item_id: string;
+  quantity: number;
+  modifiers?: Array<{ modifier_id: string }>;
+  course_id?: string;
+  free_quantity?: number;
+  notes?: string;
+}
+
+export interface ModifyOrderResult {
+  order_id: string;
+  subtotal: number;
+  tax: number;
+  total: number;
+  delivery_fee?: number;
+  currency_code: string;
+  kds_ticket_ids: string[];
+}
+
+export async function modifyOrder(orderId: string, items: ModifyOrderItem[]) {
+  if (!orderId) throw new Error('orderId required');
+  if (!Array.isArray(items) || items.length === 0) throw new Error('items must be a non-empty array');
+
+  const { data, error } = await api.request<ModifyOrderResult>(
+    'PATCH',
+    `/pos/orders/${encodeURIComponent(orderId)}/items`,
+    { body: { items } },
+  );
+  if (error) {
+    const e: FetchError = new Error(error.message || 'Failed to modify order');
+    e.status = error.status;
+    throw e;
+  }
+  return data;
+}
+
+// ---- Adjustment endpoints (return / void) ----------------------------------
+
+/**
+ * Apply a return-style adjustment against an order. The backend exposes
+ * separate endpoints per adjustment type (void / refund / comp / price-override).
+ * Resolves the route from `reason` so callers don't have to think about it.
+ *
+ * Body sent matches the adjustments handler:
+ *   { reason_code, applied_by_staff_id, approver_staff_id, approver_pin }
+ */
+export async function applyOrderAdjustment({
+  orderId,
+  reason,            // 'refund' | 'void' | 'comp' | 'manager_discount'
+  appliedByStaffId,
+  approverStaffId,
+  approverPin,
+  itemId,            // required for comp
+}: {
+  orderId: string;
+  // `string & {}` (not bare `string`) keeps the documented literals from
+  // being swallowed by the wider type — IDE autocomplete still suggests
+  // them, while any other string is still accepted for forward
+  // compatibility with new reason codes the backend might add.
+  reason: 'refund' | 'void' | 'comp' | 'manager_discount' | (string & {});
+  appliedByStaffId?: string;
+  approverStaffId?: string;
+  approverPin?: string;
+  itemId?: string;
+}) {
+  if (!orderId) throw new Error('orderId required');
+
+  let endpoint: string;
+  switch (reason) {
+    case 'void':
+      endpoint = `/orders/${encodeURIComponent(orderId)}/void`;
+      break;
+    case 'refund':
+    case 'manager_discount':
+      endpoint = `/orders/${encodeURIComponent(orderId)}/refund`;
+      break;
+    case 'comp':
+      if (!itemId) throw new Error('itemId required for comp adjustment');
+      endpoint = `/orders/${encodeURIComponent(orderId)}/items/${encodeURIComponent(itemId)}/comp`;
+      break;
+    default:
+      // Fallback to refund — keeps the UI working if a new reason is added
+      // before this switch is updated.
+      endpoint = `/orders/${encodeURIComponent(orderId)}/refund`;
+  }
+
+  const body = {
+    reason_code: reason,
+    applied_by_staff_id: appliedByStaffId || '',
+    approver_staff_id: approverStaffId || '',
+    approver_pin: approverPin || '',
+  };
+
+  const { data, error } = await api.request('POST', endpoint, { body });
+  if (error) {
+    const e: FetchError = new Error(error.message || 'Adjustment failed');
+    e.status = error.status;
+    throw e;
+  }
+  return data;
+}

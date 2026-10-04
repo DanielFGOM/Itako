@@ -1,0 +1,53 @@
+package testenv
+
+import (
+	"context"
+	"fmt"
+
+	"github.com/testcontainers/testcontainers-go"
+	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
+	"github.com/testcontainers/testcontainers-go/wait"
+)
+
+// startContainer launches a postgres:16-alpine container via testcontainers-go
+// and returns the DSN plus a cleanup function that terminates the container.
+//
+// Returns an error wrapping the Docker connection failure if Docker is absent,
+// which the caller (startViaContainers) detects via isDockerMissing.
+//
+// The bootstrap superuser MUST be named "postgres". migrations/001_baseline.sql
+// carries four `ALTER DEFAULT PRIVILEGES FOR ROLE postgres` statements, and
+// Postgres rejects those with `role "postgres" does not exist` when the cluster
+// was initialised under any other name. This container previously bootstrapped
+// as "bb_test", so migration 001 failed, startViaContainers fell through to the
+// scratch-DB path, DATABASE_URL was unset, and StartPostgres returned ErrSkip —
+// at which point every DB suite's TestMain printed one line and exited 0. The
+// whole integration tier reported `ok` while running no assertions at all.
+func startContainer(ctx context.Context) (connStr string, cleanup func(), err error) {
+	ctr, err := tcpostgres.Run(ctx,
+		"postgres:16-alpine",
+		tcpostgres.WithDatabase("bb_test"),
+		tcpostgres.WithUsername("postgres"),
+		tcpostgres.WithPassword("bb_test"),
+		testcontainers.WithWaitStrategy(
+			wait.ForLog("database system is ready to accept connections").
+				WithOccurrence(2),
+		),
+	)
+	if err != nil {
+		return "", func() {}, fmt.Errorf("start postgres container: %w", err)
+	}
+
+	dsn, err := ctr.ConnectionString(ctx, "sslmode=disable")
+	if err != nil {
+		_ = ctr.Terminate(ctx)
+		return "", func() {}, fmt.Errorf("container connection string: %w", err)
+	}
+
+	return dsn, func() {
+		if err := ctr.Terminate(ctx); err != nil {
+			// Non-fatal — the container will be GC'd by the Docker daemon.
+			_ = err
+		}
+	}, nil
+}

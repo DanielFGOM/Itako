@@ -1,0 +1,595 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  /* Custom Scrollbar Styles */
+  ::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  ::-webkit-scrollbar-thumb {
+    background: hsl(var(--border) / 0.7);
+    border-radius: 100vh;
+  }
+
+  ::-webkit-scrollbar-thumb:hover {
+    background: hsl(var(--beepbite-border-medium) / 0.9);
+  }
+
+  /* Firefox */
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: hsl(var(--border) / 0.7) transparent;
+  }
+
+  /*
+   * ─── "Ticket Rail" design system ──────────────────────────────────────
+   * A restaurant POS is read under kitchen-window glare, tapped with wet
+   * hands mid-rush, and trusted with the day's cash. The palette below is
+   * built around that, not around a marketing dashboard:
+   *   - Warm "order-pad paper" light theme instead of clinical white — a
+   *     tenant staring at a counter screen for a 10-hour shift.
+   *   - A charcoal chrome (matches the kitchen-display dark theme, so the
+   *     KDS and the rest of the app read as one product, not two).
+   *   - A darker, more assertive "safety orange" than the old soft peach —
+   *     it needs to carry white text at AA contrast on a button, not just
+   *     look nice as a gradient.
+   *   - Destructive red is a genuinely different hue+shape story (see the
+   *     .hazard-stripe utility and Button's destructive variant), not a
+   *     recolour of the same pill.
+   */
+  :root {
+    --background: 32 28% 97%;       /* warm paper, not clinical white */
+    --foreground: 20 16% 11%;       /* warm ink */
+    --card: 0 0% 100%;
+    --card-foreground: 20 16% 11%;
+    --popover: 0 0% 100%;
+    --popover-foreground: 20 16% 11%;
+
+    /* Primary: "kitchen orange" — deeper and more saturated than a soft
+       peach, so it clears 4.5:1 with white text on a filled button. */
+    --primary: 0 74% 42%;
+    --primary-foreground: 0 0% 100%;
+    --secondary: 215 28% 17%;
+    --secondary-foreground: 0 0% 100%;
+    --muted: 42 35% 93%;
+    --muted-foreground: 20 9% 38%;
+    --accent: 38 92% 91%;
+    --accent-foreground: 0 55% 30%;
+
+    /* Destructive is a different hue *and* gets a different shape via the
+       Button component and .hazard-stripe — colour alone is never the only
+       signal for void/refund/delete. */
+    --destructive: 353 74% 36%;
+    --destructive-foreground: 0 0% 100%;
+
+    /* Caution — manager-approval-required, aging tickets, low stock. A
+       third, distinct signal so "needs attention" never gets confused with
+       "irreversible". */
+    --warning: 32 90% 34%;
+    --warning-foreground: 0 0% 100%;
+    --success: 152 62% 26%;
+    --success-foreground: 0 0% 100%;
+
+    --border: 26 16% 83%;
+    --input: 26 16% 80%;
+    --ring: 0 74% 42%;
+
+    --chart-1: 0 74% 42%;
+    --chart-2: 38 92% 50%;
+    --chart-3: 152 55% 34%;
+    --chart-4: 205 70% 42%;
+    --chart-5: 280 40% 48%;
+    --radius: 0.5rem;
+
+    /* Legacy BeepBite aliases — kept so existing call sites (.beepbite-*
+       utility classes) don't need touching; values now point at the
+       Ticket Rail palette above instead of the old soft-orange scheme. */
+    --beepbite-orange: 0 74% 42%;
+    --beepbite-orange-soft: 24 88% 48%;
+    --beepbite-accent: 38 92% 91%;
+    --beepbite-text-primary: 20 16% 11%;
+    --beepbite-text-secondary: 20 10% 30%;
+    --beepbite-text-tertiary: 20 9% 42%;
+    --beepbite-background: 32 28% 97%;
+    --beepbite-background-light: 30 20% 95%;
+    --beepbite-background-cream: 30 90% 95%;
+    --beepbite-success: 152 62% 26%;
+    --beepbite-warning: 32 90% 34%;
+    --beepbite-error: 353 74% 36%;
+    --beepbite-border-light: 26 16% 83%;
+    --beepbite-border-medium: 26 14% 72%;
+    --beepbite-gradient-start: 0 74% 42%;
+    --beepbite-gradient-end: 38 92% 50%;
+  }
+
+  /* Dark chrome doubles as the KDS palette (bg-gray-950/900 in the kitchen
+     display components sit right alongside these values), so switching a
+     back-office screen to dark mode and walking into the kitchen reads as
+     one continuous product instead of two different apps. */
+  .dark {
+    --background: 222 22% 8%;
+    --foreground: 210 20% 96%;
+    --card: 222 18% 12%;
+    --card-foreground: 210 20% 96%;
+    --popover: 222 18% 12%;
+    --popover-foreground: 210 20% 96%;
+    --primary: 22 92% 52%;
+    --primary-foreground: 20 30% 10%;
+    --secondary: 217 14% 26%;
+    --secondary-foreground: 210 20% 96%;
+    --muted: 217 16% 18%;
+    --muted-foreground: 216 12% 65%;
+    --accent: 217 16% 20%;
+    --accent-foreground: 30 90% 80%;
+    --destructive: 355 78% 52%;
+    --destructive-foreground: 0 0% 100%;
+    --warning: 38 92% 50%;
+    --warning-foreground: 20 30% 10%;
+    --success: 152 55% 40%;
+    --success-foreground: 0 0% 100%;
+    --border: 217 15% 26%;
+    --input: 217 15% 26%;
+    --ring: 22 92% 58%;
+
+    --chart-1: 22 92% 55%;
+    --chart-2: 38 92% 55%;
+    --chart-3: 152 55% 45%;
+    --chart-4: 205 80% 55%;
+    --chart-5: 280 55% 62%;
+
+    --beepbite-orange: 22 92% 52%;
+    --beepbite-orange-soft: 28 92% 56%;
+    --beepbite-accent: 217 16% 20%;
+    --beepbite-text-primary: 210 20% 96%;
+    --beepbite-text-secondary: 216 12% 78%;
+    --beepbite-text-tertiary: 216 12% 65%;
+    --beepbite-background: 222 22% 8%;
+    --beepbite-background-light: 217 16% 18%;
+    --beepbite-background-cream: 217 16% 18%;
+    --beepbite-success: 152 55% 40%;
+    --beepbite-warning: 38 92% 50%;
+    --beepbite-error: 355 78% 52%;
+    --beepbite-border-light: 217 15% 26%;
+    --beepbite-border-medium: 217 14% 34%;
+  }
+
+  /* Apply border and background styles */
+  * {
+    @apply border-border outline-ring/50;
+  }
+  
+  body {
+    @apply bg-background text-foreground;
+    font-family: 'Archivo Variable', 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+    font-variation-settings: 'wdth' 100;
+    line-height: 1.5;
+    font-weight: 400;
+    font-synthesis: none;
+    text-rendering: optimizeLegibility;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    margin: 0;
+    padding: 0;
+    min-height: 100vh;
+    width: 100%;
+    /* Mobile optimizations */
+    overflow-x: hidden;
+    touch-action: manipulation;
+  }
+  
+  /* One family across the whole product — Archivo Variable — used two ways:
+     normal width for reading (body copy, forms, tables) and condensed+black
+     for anything that has to be read at a glance or at distance (headings,
+     KDS tickets, order numbers, POS category tabs). Same download, both
+     jobs, so nothing serif/sans clashes and nothing extra ships. */
+  h1, h2, h3 {
+    font-weight: 800;
+    letter-spacing: -0.01em;
+    font-variation-settings: 'wdth' 92;
+  }
+
+  h1 { line-height: 1.05; }
+  h2 { line-height: 1.12; }
+  h3 { line-height: 1.2; }
+
+  /* .font-display is kept as an alias so existing call sites need no change;
+     it now selects condensed-black Archivo instead of Inter at 700. */
+  .font-display {
+    font-weight: 800;
+    letter-spacing: -0.01em;
+    font-variation-settings: 'wdth' 92;
+  }
+  .font-display-italic {
+    font-weight: 700;
+    font-style: italic;
+    letter-spacing: -0.005em;
+    font-variation-settings: 'wdth' 92;
+  }
+
+  /* .font-ticket — the condensed-black extreme of the same family. Reserved
+     for things that must be read across a kitchen or at a glance during a
+     rush: KDS ticket numbers, POS order totals, big countdown timers. */
+  .font-ticket {
+    font-weight: 900;
+    letter-spacing: -0.01em;
+    font-variation-settings: 'wdth' 70;
+  }
+
+  /* Link styles */
+  a {
+    font-weight: 500;
+    color: hsl(var(--primary));
+    text-decoration: inherit;
+  }
+  a:hover {
+    color: hsl(var(--primary) / 0.8);
+  }
+  
+  /* Button reset */
+  button {
+    font-family: inherit;
+    cursor: pointer;
+    /* Touch optimization */
+    touch-action: manipulation;
+  }
+
+  /* Input optimizations for mobile */
+  input, textarea, select {
+    font-size: 16px; /* Prevents zoom on iOS */
+  }
+  
+  @media (min-width: 640px) {
+    input, textarea, select {
+      font-size: inherit;
+    }
+  }
+
+  /* Custom BeepBite utility classes */
+  .beepbite-gradient {
+    background: linear-gradient(135deg, hsl(var(--beepbite-gradient-start)), hsl(var(--beepbite-gradient-end)));
+  }
+  
+  .beepbite-gradient-text {
+    background: linear-gradient(135deg, hsl(var(--beepbite-gradient-start)), hsl(var(--beepbite-gradient-end)));
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+  }
+
+  /* Restaurant-optimized color utility classes */
+  .beepbite-text-primary {
+    color: hsl(var(--beepbite-text-primary));
+  }
+  
+  .beepbite-text-secondary {
+    color: hsl(var(--beepbite-text-secondary));
+  }
+  
+  .beepbite-text-tertiary {
+    color: hsl(var(--beepbite-text-tertiary));
+  }
+  
+  .beepbite-bg-cream {
+    background-color: hsl(var(--beepbite-background-cream));
+  }
+  
+  .beepbite-border-light {
+    border-color: hsl(var(--beepbite-border-light));
+  }
+  
+  .beepbite-border-medium {
+    border-color: hsl(var(--beepbite-border-medium));
+  }
+
+  .glass-effect {
+    background: rgba(255, 255, 255, 0.95);
+    backdrop-filter: blur(10px);
+    border: 1px solid rgba(255, 255, 255, 0.2);
+  }
+
+  .dark .glass-effect {
+    background: rgba(0, 0, 0, 0.95);
+    backdrop-filter: blur(10px);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+  }
+
+  /* Mobile-first responsive utilities */
+  .mobile-container {
+    @apply px-4 sm:px-6 lg:px-8;
+  }
+
+  .mobile-text {
+    @apply text-sm sm:text-base;
+  }
+
+  .mobile-heading {
+    @apply text-xl sm:text-2xl lg:text-3xl;
+  }
+
+  .mobile-subheading {
+    @apply text-lg sm:text-xl lg:text-2xl;
+  }
+
+  .mobile-grid-cols-auto {
+    @apply grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4;
+  }
+
+  .mobile-space-y {
+    @apply space-y-4 sm:space-y-6;
+  }
+
+  .mobile-button {
+    @apply h-10 sm:h-11 text-sm sm:text-base;
+  }
+
+  .mobile-card-padding {
+    @apply p-4 sm:p-6;
+  }
+
+  /* Hero Animation Custom Styles */
+  .animate-in {
+    animation: fade-in 0.5s ease-out forwards;
+  }
+
+  .slide-in-from-right-5 {
+    animation: slide-in-right 0.7s ease-out forwards;
+  }
+
+  .fade-in {
+    animation: fade-in 1s ease-out forwards;
+  }
+
+  @keyframes fade-in {
+    from {
+      opacity: 0;
+      transform: translateY(10px);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
+
+  @keyframes slide-in-right {
+    from {
+      opacity: 0;
+      transform: translateX(20px);
+    }
+    to {
+      opacity: 1;
+      transform: translateX(0);
+    }
+  }
+
+  /* Enhanced pulse animation for hero elements */
+  .hero-pulse {
+    animation: hero-pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+  }
+
+  @keyframes hero-pulse {
+    0%, 100% {
+      opacity: 1;
+      transform: scale(1);
+    }
+    50% {
+      opacity: 0.8;
+      transform: scale(1.05);
+    }
+  }
+
+  /* Smooth transitions for hero steps */
+  .hero-transition {
+    transition: all 0.7s cubic-bezier(0.4, 0, 0.2, 1);
+  }
+
+  /* Landing page animation utilities */
+  @keyframes blob {
+    0%, 100% { transform: translate(0px, 0px) scale(1); }
+    33% { transform: translate(30px, -50px) scale(1.1); }
+    66% { transform: translate(-20px, 20px) scale(0.9); }
+  }
+  .animate-blob {
+    animation: blob 14s ease-in-out infinite;
+  }
+  .animation-delay-2000 { animation-delay: 2s; }
+  .animation-delay-4000 { animation-delay: 4s; }
+  .animation-delay-6000 { animation-delay: 6s; }
+
+  @keyframes float-slow {
+    0%, 100% { transform: translateY(0px); }
+    50% { transform: translateY(-12px); }
+  }
+  .animate-float-slow {
+    animation: float-slow 6s ease-in-out infinite;
+  }
+
+  @keyframes float-medium {
+    0%, 100% { transform: translateY(0px) rotate(0deg); }
+    50% { transform: translateY(-8px) rotate(2deg); }
+  }
+  .animate-float-medium {
+    animation: float-medium 4.5s ease-in-out infinite;
+  }
+
+  @keyframes gradient-shift {
+    0%, 100% { background-position: 0% 50%; }
+    50% { background-position: 100% 50%; }
+  }
+  .animate-gradient-shift {
+    background-size: 200% 200%;
+    animation: gradient-shift 8s ease infinite;
+  }
+
+  @keyframes shimmer {
+    0% { transform: translateX(-100%); }
+    100% { transform: translateX(100%); }
+  }
+  .animate-shimmer {
+    animation: shimmer 2.5s linear infinite;
+  }
+
+  @keyframes marquee {
+    0% { transform: translateX(0); }
+    100% { transform: translateX(-50%); }
+  }
+  .animate-marquee {
+    animation: marquee 30s linear infinite;
+  }
+
+  @keyframes pulse-ring {
+    0% { transform: scale(0.8); opacity: 0.8; }
+    80%, 100% { transform: scale(2.4); opacity: 0; }
+  }
+  .animate-pulse-ring {
+    animation: pulse-ring 2s cubic-bezier(0.215, 0.61, 0.355, 1) infinite;
+  }
+
+  @keyframes ticker {
+    0% { opacity: 0; transform: translateY(8px); }
+    10%, 90% { opacity: 1; transform: translateY(0); }
+    100% { opacity: 0; transform: translateY(-8px); }
+  }
+
+  /* Subtle grid background */
+  .bg-grid-orange {
+    background-image:
+      linear-gradient(to right, rgba(192, 66, 12, 0.08) 1px, transparent 1px),
+      linear-gradient(to bottom, rgba(192, 66, 12, 0.08) 1px, transparent 1px);
+    background-size: 48px 48px;
+  }
+  /* Dark-mode variant — slightly more visible grid lines */
+  .bg-grid-orange-dark {
+    background-image:
+      linear-gradient(to right, rgba(192, 66, 12, 0.12) 1px, transparent 1px),
+      linear-gradient(to bottom, rgba(192, 66, 12, 0.12) 1px, transparent 1px);
+    background-size: 48px 48px;
+  }
+
+  .bg-noise {
+    background-image: radial-gradient(rgba(0,0,0,0.03) 1px, transparent 1px);
+    background-size: 6px 6px;
+  }
+
+  /* Text wrapping niceties for headings + lead paragraphs */
+  .text-balance { text-wrap: balance; }
+  .text-pretty { text-wrap: pretty; }
+
+  /* Interactive card: subtle lift + shadow on hover. Compose with the Card
+     component or any rounded surface. */
+  .card-interactive {
+    transition: transform 0.25s cubic-bezier(0.22, 1, 0.36, 1),
+                box-shadow 0.25s cubic-bezier(0.22, 1, 0.36, 1),
+                border-color 0.25s ease;
+    will-change: transform;
+  }
+  .card-interactive:hover {
+    transform: translateY(-3px);
+    box-shadow: 0 12px 32px -8px rgb(16 24 40 / 0.14), 0 4px 10px -4px rgb(16 24 40 / 0.08);
+  }
+
+  /* Small staggered-reveal delay steps for CSS-only entrance animations. */
+  .delay-75 { animation-delay: 75ms; }
+  .delay-150 { animation-delay: 150ms; }
+  .delay-225 { animation-delay: 225ms; }
+  .delay-300 { animation-delay: 300ms; }
+
+  /* ─── Destructive-action motifs ──────────────────────────────────────────
+     "Errors are money": void, refund, delete and drawer-open actions must
+     never be a same-shape button one accidental tap from the safe one. The
+     hazard stripe is a second, colour-blind-safe signal (diagonal texture,
+     not just red) reserved for the most irreversible actions — full void,
+     delete menu item, delete category, hard-refund. Ordinary destructive
+     buttons (Button variant="destructive") already differ by colour, icon
+     and (slightly) shape; reach for .hazard-stripe on the ones that cannot
+     be undone at all. */
+  .hazard-stripe {
+    background-image: repeating-linear-gradient(
+      135deg,
+      hsl(var(--destructive)) 0px,
+      hsl(var(--destructive)) 10px,
+      hsl(var(--destructive-foreground) / 0.16) 10px,
+      hsl(var(--destructive-foreground) / 0.16) 20px
+    );
+  }
+
+  /* A torn-ticket perforation rule — used between "sent" rounds on a POS
+     ticket, or between line items on a receipt. Decorative but on-theme;
+     never load-bearing for meaning. */
+  .ticket-perforation {
+    border: none;
+    height: 0;
+    border-top: 2px dashed hsl(var(--border));
+  }
+
+  /* Strong, unmissable focus treatment for counter staff running the till
+     from a keyboard/scanner rather than touch. Shadcn's default
+     `ring-1` is too subtle under kitchen-window glare; this is opt-in on
+     custom (non-Button) interactive elements such as ticket rows and table
+     tiles — Button/Input/Select etc. already carry an equivalent ring. */
+  .focus-ring-strong {
+    outline: none;
+  }
+  .focus-ring-strong:focus-visible {
+    outline: 3px solid hsl(var(--ring));
+    outline-offset: 2px;
+    border-radius: calc(var(--radius) - 2px);
+  }
+
+  /* Offline / sync status — see src/components/ui/sync-status.jsx. Kept as a
+     handful of small utilities rather than one-off inline styles so every
+     surface (top bar badge, chrome-less POS/KDS strip) agrees on the same
+     three states. */
+  .sync-pill-offline { @apply bg-warning text-warning-foreground; }
+  .sync-pill-syncing { @apply bg-muted text-muted-foreground; }
+  .sync-pill-ok      { @apply bg-success/10 text-success; }
+  .sync-pill-error   { @apply bg-destructive text-destructive-foreground; }
+
+  @media (prefers-reduced-motion: reduce) {
+    .animate-blob,
+    .animate-float-slow,
+    .animate-float-medium,
+    .animate-gradient-shift,
+    .animate-shimmer,
+    .animate-marquee,
+    .animate-pulse-ring,
+    .animate-fade-up,
+    .animate-fade-in,
+    .animate-scale-in,
+    .hero-pulse {
+      animation: none !important;
+    }
+    .card-interactive { transition: none !important; }
+    .card-interactive:hover { transform: none !important; }
+
+    /* Global fallback for tailwindcss-animate's data-[state]:animate-in /
+       animate-out utilities (fade-in-0, zoom-in-95, slide-in-from-*, …).
+       Every Dialog, AlertDialog, Sheet, Select, DropdownMenu, Tooltip, Toast
+       and the KDS ticket card's slide-in-from-bottom drive their open/close
+       motion through these utility classes, none of which carry a
+       motion-reduce: variant individually — so collapse the timing here once
+       for the whole app instead of patching every call site. Only durations
+       are floored (not disabled outright) so data-driven state, like a
+       dialog's open/closed position, still resolves correctly. */
+    *, *::before, *::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+    }
+  }
+}
+
+@layer components {
+  /* Retained alias — nothing in the app references this class today, but it
+     shipped as public-ish API in previous waves. Now points at the current
+     body family instead of Inter. */
+  .font-inter {
+    font-family: 'Archivo Variable', 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+  }
+}

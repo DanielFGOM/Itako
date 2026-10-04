@@ -1,0 +1,213 @@
+# Features
+
+What each surface actually does, tagged the way [README](../README.md) tags
+things: **Built** and **Not built** are different words, used precisely. See
+[README's Status table](../README.md#status) for the top-level summary — this
+document goes one level deeper, area by area.
+
+There is no tier that unlocks a feature below. There is one binary, and every
+feature in it is in every copy.
+
+## Front of house
+
+**Built.**
+
+- Touch POS: tabs, seat/amount splits, modifiers, courses, void/comp/discount
+  with manager approval, split tender.
+- Quick POS kiosk mode.
+- Floor plan and table sessions — live status, assignment, turnover.
+- Customer-facing display.
+- Reservations and a waitlist.
+- Gift cards, store credit, and house accounts (with account-level invoicing).
+- Loyalty, including stamp cards.
+- Promotions and coupon codes.
+- Receipt/kitchen printing to **network (TCP/IP) ESC/POS printers**, plus the
+  ESC/POS cash-drawer kick over that same connection — both genuinely send
+  bytes to the printer's IP on port 9100, no agent or driver needed. **USB
+  printing is a stub**: the handler always reports success with "usb: send
+  via pos agent," and no such agent exists in this repository — don't rely on
+  it. Every receipt can also print from the browser via `window.print()` as a
+  fallback, network or USB, using whatever the OS already knows about.
+
+## Kitchen
+
+**Built.**
+
+- Kitchen display system: per-station routing, an expo view, a fan-out queue,
+  fire timers, and course-fire-on-bump (fire the next course automatically
+  when the previous one is bumped).
+- Recipes with recursive costing (a dish's cost follows its ingredients'
+  costs through sub-recipes), the 86 list, and prep-step tracking.
+
+## Inventory & purchasing
+
+**Built.**
+
+- Suppliers, purchase orders, goods receipts, and 3-way invoice matching.
+- Stock movements and waste tracking, with reorder suggestions.
+- Ingredient price history.
+
+## Money
+
+**Built**, with one deliberate absence:
+
+> [!IMPORTANT]
+> **BeepBite records tenders; it does not process cards.** Cash, card,
+> transfer and voucher are recorded against the order and reconciled into the
+> drawer at close. "Card" means your own card machine on your own counter —
+> BeepBite records the amount and the tender type, nothing more. There is no
+> payment gateway, no card data ever reaches it, and it holds no PCI scope.
+> Card processing was deliberately removed, not left unbuilt — see
+> `CHANGELOG.md`.
+
+- Cash drawer sessions: denomination counts, blind close, paid-in/paid-out.
+- Void, comp, price-override and refund, each with a reason code and manager
+  approval where the role requires it.
+- Idempotency keys on order and payment inserts, so a retried request cannot
+  double-record a tender.
+
+**Optional, off by default:** a verify-on-return online-payment path for
+orders with no counter to pay at (a WhatsApp or web order). It is
+unit- and integration-tested but has **never been run against a live
+processor** — the default build links no gateway code at all. See
+[docs/ONLINE-PAYMENTS.md](ONLINE-PAYMENTS.md) for exactly what "verified"
+would mean and what isn't yet.
+
+## Staff
+
+**Built.**
+
+- Role-based access: owner, manager, cashier/staff roles, each gated by
+  per-member capability flags, not a hardcoded role list.
+- PIN-based till actor overlay on top of a logged-in session (a manager can
+  step in to authorize a void without anyone logging out), with a 5-strike /
+  15-minute lockout.
+- Time clock, tip pools, and a payroll export (hours, commission, tips —
+  export, not a payroll *run*; BeepBite does not file or pay anyone's taxes).
+- An audit log recording who did what, tied to the authenticated identity —
+  never a client-supplied field.
+
+## Ordering & delivery
+
+| Channel | State |
+|---|---|
+| Web storefront / "QR at the table" | **Built, with a caveat.** Public store page, cart, checkout, order status — delivery or collection only. There is no table-number field and no floor-plan binding: a QR code just opens this same public menu on a phone. "QR at the table" today means a printed QR, not an order tied to a seat. |
+| WhatsApp ordering | **Built** — a direct Meta Cloud API integration using **your own** WhatsApp Business credentials. Entirely dark without them: no BeepBite number pool, no shared account. |
+| Order-ready notifications over WhatsApp | **Built.** Replaces a buzzer/pager; sent when kitchen marks an order ready. |
+| Channel-adapter seam | **Built.** `internal/channel` defines one interface every ordering rail implements, with a capability model and a shared text degradation — a rail that cannot render a list prints it numbered and still resolves the customer's reply back to the right row ID. The chatbot depends on the interface and holds no Meta types. `internal/channel/whatsapp` is the first adapter. |
+| Discord, Slack, email ordering | **Not built.** The seam above makes each one an adapter rather than a second integration, but no adapter exists yet. What changed is the cost of adding one, not the feature. |
+| Ordering over DMTAP / KOTVA | **Experimental.** A research direction, not a planned feature with a slot: no KOTVA code is in this tree, none is required, and the adoption is staged behind named preconditions in `ROADMAP.md`. Treat it as a thing that might not land. |
+| Delivery zones, driver portal, order tracking | **Built**, but less exercised than the POS. Zones use polygon lookup; drivers get assignments, shifts and a location-ping feed; customers get a public `/track/:token` page with a progress stepper and ETA. The map only appears once an order reaches `out_for_delivery`, and a server-side privacy gate withholds the driver's live position from that anonymous link before then — this is not a live driver-tracking map for the whole trip. |
+| Pickup slots | **Built.** |
+
+## Customer engagement
+
+**Built.**
+
+- Reviews: collection and owner responses (public read, authenticated write).
+- Customer search and recent-order lookup for taking a repeat order quickly.
+- Favorites.
+
+Review requests and other automated messages ride the same WhatsApp
+integration above — they are notifications sent through your own credentials,
+not a separate marketing platform.
+
+## Reporting
+
+**Built, but partial**, as read-only database views, gated by a
+`can_view_reports` capability. Six views exist in Postgres; the app has a
+screen for two of them: daily sales summary and hourly sales heatmap. Menu
+engineering (which items earn their keep), labor hours, theoretical-vs-actual
+cost of goods, and revenue by payment method are real, queryable views with
+**no screen wired up to them yet** — `src/services/analytics.js` doesn't fetch
+them. There is no separate analytics product — these are the same Postgres
+your orders live in, queried directly, once a screen queries them.
+
+Multi-location reporting across a three-currency operation is **built as an
+off-by-default conversion seam** (`internal/fx`): it makes no network call
+when disabled and never rewrites a stored amount. It is for one operator
+wanting a single consolidated set of books, not a platform-wide FX billing
+system — BeepBite doesn't bill anyone.
+
+## Security & isolation
+
+**Built.**
+
+- Row-level security on every tenant-scoped table from creation, enforced
+  server-side from the authenticated identity — never from a filter the
+  client happens to send.
+- Audit log and idempotency keys throughout mutating paths.
+- No PCI scope, because card data never reaches the application in the first
+  place — a property of what BeepBite refuses to do, not a control it added.
+
+What BeepBite cannot promise on your behalf: **GDPR, PCI-DSS, SOC 2, or any
+other compliance certification.** Those describe an operator's practices, not
+software they installed. Nobody has audited a self-hosted deployment you run,
+because there is no one operator to audit.
+
+## Currency, tax & locale
+
+**Built.** Currency, tax convention, timezone, locale and dial code all
+resolve per location from configuration. No hardcoded currency or country
+defaults remain in application logic.
+
+## Reachability — what actually needs a URL
+
+A machine on the shop's own network with a Postgres beside it is a complete
+installation. Nothing below needs a port forward, a domain or a tunnel unless a
+customer is ordering from off the premises.
+
+| Surface | Needs inbound reachability? | Why |
+|---|---|---|
+| Till, kitchen display, floor plan, back office | **No** | Ordinary LAN traffic to the binary you started |
+| Driver app and staff on the shop's Wi-Fi | **No** | Same listener, same network |
+| WhatsApp ordering | **Yes — public HTTPS** | Meta's Cloud API is webhook-only. It POSTs to `/webhooks/whatsapp`, verified against `WHATSAPP_APP_SECRET` over `X-Hub-Signature-256`. Meta offers no polling mode to switch to |
+| Web storefront (incl. printed "QR at the table"), `/track/:token` | **Yes — public HTTPS** | A customer's phone has to reach the page, like any other web page |
+| Online-payment return | **Yes — public HTTPS** | The gateway redirects the buyer to `BEEPBITE_API_PUBLIC_URL`. Optional, and see `ONLINE-PAYMENTS.md` — never run against a live processor |
+
+**Getting a URL is a commodity problem, and not a component of BeepBite.**
+cloudflared, a Tailscale funnel, ngrok, a small VPS running nginx,
+[Ephor](https://github.com/vul-os/ephor)'s reachability broker, the Vulos relay —
+BeepBite cannot tell them apart. There is deliberately **no provider abstraction
+in the code**: no interface, no plugin registry, no vendor list. It is one
+string, `BEEPBITE_API_PUBLIC_URL`, and swapping one provider for another is
+editing a line and restarting. A string is the right size for this seam; anything
+larger would be an invented dependency.
+
+## Installation & data ownership
+
+| Claim | State |
+|---|---|
+| Single Go binary | **Built.** The release workflow embeds the frontend and cross-compiles one binary for linux/darwin × amd64/arm64. |
+| Single-*file* install (no separate database service) | **Planned, not done.** Postgres is required today; there is no SQLite driver in the tree yet. |
+| Offline tolerance at the till | **Not implemented as a feature.** Client-side scaffolding exists (`src/offline/`) — ULIDs, an idempotency helper, a mutation queue — but nothing in the running app uses it yet. A dropped connection today behaves like it always did. |
+| Nothing phones home | **Built.** A fresh install makes no outbound network calls. WhatsApp, maps and AI are each dark until you supply your own credentials. |
+| Backups | **Your responsibility.** It's your Postgres; BeepBite has no backup service of its own to sell you. |
+| Node identity (Ed25519) | **Library only, unwired.** `internal/nodeid` generates and persists a node keypair (atomic write, mode 0600 enforced, refuses a group-readable key) and signs over a length-prefixed domain-separated envelope. Nothing in the running server calls it yet; it is a prerequisite for multi-branch sync and for courier identity. |
+| Merge algebra (HLC oplog) | **Library only, unwired.** `internal/oplog` implements a hybrid logical clock with a drift bound, a last-writer-wins register, an add-only set and version vectors, with a seeded convergence test asserting any permutation of the same ops reaches the same state. It has no persistence, no transport and no wire protocol, nothing in the server calls it, and it is explicitly **not** an implementation of any external sync specification. |
+| Ownership registry & emit layer | **Real and tested, switched off.** `internal/sync/ownership` classifies every table (branch-owned, group-owned, ledger, local) and `internal/sync/emit` turns a row write into the operation that registry implies. `internal/handlers/data` calls it on every insert/update/delete — but only once `WithEmitter` has attached a live `*emit.Emitter`, and the only place in this repository that calls `WithEmitter` is its own integration test. `cmd/server` never calls it, so the shipped binary always runs with a nil emitter and produces **zero** sync operations at runtime. |
+| Runs on | **Linux and macOS**, x86-64 and ARM — four release binaries. Windows is not built. Beyond that the only requirement is a Postgres you can reach. |
+| A BeepBite cloud | **Does not exist, by design.** There is no hosted tier and no account. If you want the till reachable from outside the shop, that is a second machine *you* deploy — a VPS, or a reachability broker such as [Ephor](https://github.com/vul-os/ephor) that your box dials out to. It is your node either way. |
+| Vulos OS | **Optional, never required.** BeepBite is designed to also be hosted as an app by the Vulos OS, which is the long-term answer to sharing one menu and one set of books across branches. A hard runtime dependency on the OS, its control plane or KOTVA is forbidden by the product standard. |
+
+## What is not a feature
+
+- **Not a marketplace.** No directory, no discovery, no slug namespace anyone
+  else administers.
+- **Not multi-tenant SaaS.** There is no plan/tier system, no per-seat
+  pricing, no usage metering, because there is no vendor billing you.
+- **Not a support contract.** There is no phone line, no "business hours"
+  live chat, and no paid onboarding team. Documentation and the issue tracker
+  at `github.com/vul-os/beepbite` are what exists.
+- **Not multiple deployments kept in sync.** Two BeepBite instances do not
+  yet talk to each other — see `ROADMAP.md` for the planned branch-sync
+  design (hybrid-logical-clock oplog, manual peer enrolment, a shared folder
+  or a USB stick as a valid transport). Today, one instance is one
+  restaurant's data.
+- **Not a decentralised product.** The trust model of the core is one business
+  running its own database in its own building, and a point-of-sale has no
+  consensus problem to solve. Where decentralisation earns its keep is
+  *between* parties who do not trust each other — courier reputation across
+  shops, ordering channels that route around Meta and Google — and that work
+  is experimental and gated. `ROADMAP.md` refuses to promise decentralisation
+  value where there is none.

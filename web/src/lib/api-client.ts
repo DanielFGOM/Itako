@@ -1,0 +1,776 @@
+// api-client.js — a thin fetch wrapper that mimics the subset of supabase-js
+// the app uses (.from().select()/.insert()/.update()/.delete(), .rpc(), and
+// .auth.* for sign-in flows). It hits the Go backend at VITE_API_URL.
+//
+// Tokens are persisted to localStorage. The client auto-refreshes once on a
+// 401 and replays the original request.
+//
+// Actor token: when a staff PIN overlay is active the ActorTokenProvider keeps
+// an in-memory reference (_actorRef). Authenticated requests automatically
+// include X-Actor-Token if that ref holds a non-expired token. The import is
+// lazy (dynamic) to avoid a circular-module issue — the context file imports
+// nothing from here, but we still defer the read to call-time.
+
+export interface AuthSession {
+  access_token?: string;
+  refresh_token?: string;
+  user?: unknown;
+  [key: string]: unknown;
+}
+
+export interface ApiError {
+  message: string;
+  status?: number;
+  capability?: string;
+}
+
+export interface ApiResult<T = unknown> {
+  data: T | null;
+  error: ApiError | null;
+}
+
+type AuthEvent = 'SIGNED_IN' | 'SIGNED_OUT' | 'TOKEN_REFRESHED' | 'INITIAL_SESSION';
+type AuthListener = (event: AuthEvent, session: AuthSession | null) => void;
+type CapabilityListener = (capability: string) => void;
+type ManagerOverrideHandler = (
+  args: { capability: string; reason: string },
+) => Promise<string | null | undefined>;
+
+interface RequestOpts {
+  body?: unknown;
+  headers?: Record<string, string>;
+  auth?: boolean;
+  _managerOverrideAttempted?: boolean;
+}
+
+const API_URL = import.meta.env.VITE_API_URL || (typeof window !== 'undefined' ? window.location.origin : 'http://localhost:8080');
+
+const STORAGE_KEY = 'bb.auth';
+
+// Singleton ref populated by ActorTokenProvider (actor-token-context.jsx).
+// Resolved once via a side-effect import so the reference is available
+// synchronously on every subsequent request. Safe to call before the import
+// settles — the header is simply omitted on the very first request in that
+// race (essentially impossible in practice since the Provider mounts before
+// any authenticated request fires).
+// Shape when set: { _token: string, _expiresAt: number, ... }
+interface ActorRef {
+  current: { _token: string; _expiresAt: number } | null;
+}
+let _actorRefSync: ActorRef | null = null;
+import('@/context/actor-token-context')
+  .then((mod) => { _actorRefSync = mod._actorRef; })
+  .catch(() => { _actorRefSync = { current: null }; });
+
+// ---- token storage ----
+
+function readAuth(): AuthSession | null {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch {
+    return null;
+  }
+}
+
+function writeAuth(v: AuthSession | null) {
+  if (v) localStorage.setItem(STORAGE_KEY, JSON.stringify(v));
+  else localStorage.removeItem(STORAGE_KEY);
+}
+
+const listeners = new Set<AuthListener>();
+function emitAuth(event: AuthEvent, session: AuthSession | null) {
+  for (const cb of listeners) {
+    try { cb(event, session); } catch (e) { console.error(e); }
+  }
+}
+
+// ---- global missing_capability subscriber ----------------------------------
+// Components subscribe once (e.g. in a root layout useEffect) to receive a
+// toast whenever the server returns 403 { error:"missing_capability", capability:"can_xxx" }.
+const capabilityListeners = new Set<CapabilityListener>();
+export function onMissingCapability(cb: CapabilityListener) {
+  capabilityListeners.add(cb);
+  return () => capabilityListeners.delete(cb);
+}
+function emitMissingCapability(capability: string) {
+  for (const cb of capabilityListeners) {
+    try { cb(capability); } catch (e) { console.error(e); }
+  }
+}
+
+// ---- manager-override handler ----------------------------------------------
+// Register exactly ONE async handler that receives { capability, reason } and
+// returns a one-shot manager token string (or throws/returns null to abort).
+// The api-client's request() will retry the original call with that token
+// attached as X-Actor-Token for ONE request only — the actor session is NOT
+// switched globally.
+//
+// Usage: registerManagerOverrideHandler(async ({ capability }) => {
+//   const token = await requestPin({ reason: capability, isManagerOverride: true });
+//   return token;
+// });
+let _managerOverrideHandler: ManagerOverrideHandler | null = null;
+export function registerManagerOverrideHandler(fn: ManagerOverrideHandler) {
+  _managerOverrideHandler = fn;
+  return () => { if (_managerOverrideHandler === fn) _managerOverrideHandler = null; };
+}
+
+// ---- low-level fetch ----
+
+async function raw(method: string, path: string, { body, headers = {}, auth = true }: RequestOpts = {}) {
+  const h: Record<string, string> = { 'Content-Type': 'application/json', ...headers };
+  if (auth) {
+    const a = readAuth();
+    if (a?.access_token) h.Authorization = `Bearer ${a.access_token}`;
+
+    // Attach actor token from the in-memory singleton if available and valid.
+    const actorRef = _actorRefSync;
+    if (actorRef?.current?._token && actorRef.current._expiresAt > Date.now()) {
+      h['X-Actor-Token'] = actorRef.current._token;
+    }
+  }
+  const res = await fetch(`${API_URL}${path}`, {
+    method,
+    headers: h,
+    body: body === undefined ? undefined : JSON.stringify(body),
+    credentials: 'include',
+  });
+  return res;
+}
+
+let refreshing: Promise<boolean> | null = null;
+
+async function refreshIfNeeded(): Promise<boolean> {
+  const a = readAuth();
+  if (!a?.refresh_token) return false;
+  if (!refreshing) {
+    refreshing = (async () => {
+      const res = await raw('POST', '/auth/refresh', { body: { refresh_token: a.refresh_token }, auth: false });
+      if (!res.ok) {
+        writeAuth(null);
+        emitAuth('SIGNED_OUT', null);
+        return false;
+      }
+      const session = await res.json();
+      writeAuth(session);
+      emitAuth('TOKEN_REFRESHED', session);
+      return true;
+    })().finally(() => { refreshing = null; });
+  }
+  return refreshing;
+}
+
+// Shape of a JSON error body returned by the Go backend, e.g.
+// { "error": "missing_capability", "capability": "can_void" }. Only the error
+// path inspects this; a successful response's payload is the caller's own T.
+interface ErrorEnvelope {
+  error?: string;
+  capability?: string;
+}
+
+function asErrorEnvelope(payload: unknown): ErrorEnvelope | null {
+  // No cast needed: ErrorEnvelope's fields are all optional, so any plain
+  // object already structurally satisfies it once narrowed below.
+  return payload && typeof payload === 'object' && !Array.isArray(payload)
+    ? payload
+    : null;
+}
+
+async function request<T = unknown>(method: string, path: string, opts: RequestOpts = {}): Promise<ApiResult<T>> {
+  let res = await raw(method, path, opts);
+  if (res.status === 401 && opts.auth !== false) {
+    const ok = await refreshIfNeeded();
+    if (ok) res = await raw(method, path, opts);
+  }
+  if (res.status === 204) return { data: null, error: null };
+  const text = await res.text();
+  let payload: unknown = null;
+  if (text) {
+    try { payload = JSON.parse(text); } catch { payload = text; }
+  }
+  if (!res.ok) {
+    const errPayload = asErrorEnvelope(payload);
+    const msg = errPayload?.error || res.statusText || 'request failed';
+
+    // Manager-override path: on 403 missing_capability, if a handler is
+    // registered, ask for a manager PIN and replay the request ONCE with
+    // the one-shot token attached. The actor session is NOT changed globally.
+    if (
+      res.status === 403 &&
+      errPayload &&
+      errPayload.error === 'missing_capability' &&
+      errPayload.capability &&
+      _managerOverrideHandler &&
+      !opts._managerOverrideAttempted // prevent infinite retry
+    ) {
+      try {
+        const oneShotToken = await _managerOverrideHandler({
+          capability: errPayload.capability,
+          reason: errPayload.capability.replace(/_/g, ' '),
+        });
+        if (oneShotToken) {
+          // Replay the request with the override token injected.
+          const overrideOpts: RequestOpts = {
+            ...opts,
+            _managerOverrideAttempted: true,
+            headers: {
+              ...(opts.headers || {}),
+              'X-Actor-Token': oneShotToken,
+            },
+          };
+          return request<T>(method, path, overrideOpts);
+        }
+      } catch {
+        // Handler threw (user cancelled) — fall through to normal error.
+      }
+    }
+
+    // Fire global missing_capability subscribers so any subscribed toast handler
+    // can notify the user without per-call boilerplate.
+    if (res.status === 403 && errPayload && errPayload.error === 'missing_capability' && errPayload.capability) {
+      emitMissingCapability(errPayload.capability);
+    }
+    return { data: null, error: { message: msg, status: res.status, capability: errPayload?.capability } };
+  }
+  // Success: payload is the caller's declared response shape. JSON.parse
+  // necessarily loses static type information, so this assertion is the
+  // deserialization boundary — the same trust callers already place in the
+  // generic type argument T they pass to request<T>().
+  return { data: payload as T, error: null };
+}
+
+// ---- auth surface (matches supabase.auth.*) ----
+
+const auth = {
+  async signUp({ email, password, options }: {
+    email: string;
+    password: string;
+    options?: { data?: unknown; emailRedirectTo?: string };
+  }) {
+    const { data, error } = await request<AuthSession & { user?: unknown }>('POST', '/auth/signup', {
+      auth: false,
+      body: { email, password, meta: options?.data },
+    });
+    if (error) return { data: null, error };
+    writeAuth(data);
+    emitAuth('SIGNED_IN', data);
+    return { data: { user: data!.user, session: data }, error: null };
+  },
+
+  async signInWithPassword({ email, password }: { email: string; password: string }) {
+    const { data, error } = await request<AuthSession & { user?: unknown }>('POST', '/auth/signin', {
+      auth: false,
+      body: { email, password },
+    });
+    if (error) return { data: null, error };
+    writeAuth(data);
+    emitAuth('SIGNED_IN', data);
+    return { data: { user: data!.user, session: data }, error: null };
+  },
+
+  async signOut() {
+    const a = readAuth();
+    await request('POST', '/auth/signout', { body: { refresh_token: a?.refresh_token }, auth: false });
+    writeAuth(null);
+    emitAuth('SIGNED_OUT', null);
+    return { error: null };
+  },
+
+  // Genuinely no `await` in the body (purely local — reads the in-memory/
+  // localStorage session, no network I/O) but kept `async` deliberately:
+  // several real call sites (context/auth-context.tsx) already
+  // `await supabase.auth.getSession()`, matching the supabase-js surface
+  // where every auth.* method returns a Promise. Dropping `async` was
+  // tried and reverted — it turns those real `await`s into new
+  // await-thenable errors instead of removing a finding.
+  // eslint-disable-next-line @typescript-eslint/require-await
+  async getSession() {
+    const a = readAuth();
+    if (!a) return { data: { session: null }, error: null };
+    return { data: { session: a }, error: null };
+  },
+
+  async getUser() {
+    const a = readAuth();
+    if (!a) return { data: { user: null }, error: null };
+    const { data, error } = await request('GET', '/auth/me');
+    if (error) return { data: { user: null }, error };
+    return { data: { user: data }, error: null };
+  },
+
+  async refreshSession() {
+    const ok = await refreshIfNeeded();
+    if (!ok) return { data: { session: null }, error: { message: 'refresh failed' } };
+    return { data: { session: readAuth() }, error: null };
+  },
+
+  // Same reasoning as getSession() above: no await in the body, but kept
+  // `async` since context/auth-context.tsx already
+  // `await supabase.auth.updateUser(...)`.
+  // eslint-disable-next-line @typescript-eslint/require-await
+  async updateUser(_updates?: { password?: string; [key: string]: unknown }) {
+    // TODO(backend): no self-service "change own password while authenticated"
+    // endpoint exists yet. The email password-reset flow (POST /auth/password/forgot
+    // → token email → POST /auth/password/reset) is the supported path.
+    // When a /auth/me/password endpoint lands, wire it here.
+    return {
+      data: null,
+      error: {
+        message:
+          'To change your password, use the "Forgot password" link on the sign-in page. A reset link will be emailed to you.',
+      },
+    };
+  },
+
+  async resetPasswordForEmail(email: string, _opts?: { redirectTo?: string }) {
+    // POST /auth/password/forgot always returns 200 — backend never reveals
+    // whether the address exists. Mirrors the Supabase surface so call-sites
+    // don't need changes.
+    const { data, error } = await request('POST', '/auth/password/forgot', {
+      auth: false,
+      body: { email },
+    });
+    if (error) return { data: null, error };
+    return { data, error: null };
+  },
+
+  onAuthStateChange(cb: AuthListener) {
+    listeners.add(cb);
+    // fire once with current state to match supabase's behavior.
+    setTimeout(() => cb('INITIAL_SESSION', readAuth()), 0);
+    return {
+      data: {
+        subscription: {
+          unsubscribe: () => listeners.delete(cb),
+        },
+      },
+    };
+  },
+};
+
+// ---- embedded-join support ----
+//
+// supabase-js lets callers do `.select('*, customers (id, name), order_items (*)')`
+// to pull in related rows in one call. Our Go data layer doesn't parse that
+// syntax, so the client peels off joined relations, fetches the parent rows
+// with scalar columns, then does a follow-up IN query per joined table.
+//
+// Relationships are described here. A 'many' edge means the child table has
+// an FK back to the parent; we filter the child by that FK IN (parent ids).
+// A 'one' edge means the parent row carries the FK directly; we collect
+// those FK values and do IN on the child's primary key.
+
+interface FKEdge {
+  table: string;
+  kind: 'one' | 'many';
+  col: string;
+}
+
+const FK: Record<string, Record<string, FKEdge>> = {
+  // parent -> { childRelationName: { table, kind: 'one'|'many', col } }
+  //   kind 'one':  parent[col] points at child.id
+  //   kind 'many': child[col] points at parent.id
+  orders: {
+    customers:      { table: 'customers',              kind: 'one',  col: 'customer_id' },
+    order_items:    { table: 'order_items',            kind: 'many', col: 'order_id' },
+  },
+  order_items: {
+    items:                 { table: 'items',                 kind: 'one',  col: 'item_id' },
+    order_item_variations: { table: 'order_item_variations', kind: 'many', col: 'order_item_id' },
+    order_item_modifiers:  { table: 'order_item_modifiers',  kind: 'many', col: 'order_item_id' },
+  },
+  order_item_variations: {
+    item_variations:        { table: 'item_variations',        kind: 'one', col: 'variation_id' },
+    item_variation_options: { table: 'item_variation_options', kind: 'one', col: 'option_id' },
+  },
+  items: {
+    categories:      { table: 'categories',      kind: 'one',  col: 'category_id' },
+    item_variations: { table: 'item_variations', kind: 'many', col: 'item_id' },
+  },
+  item_variations: {
+    item_variation_options: { table: 'item_variation_options', kind: 'many', col: 'variation_id' },
+  },
+  item_recipes: {
+    items: { table: 'items', kind: 'one', col: 'child_item_id' },
+  },
+  organization_members: {
+    profiles: { table: 'profiles', kind: 'one', col: 'profile_id' },
+  },
+  organization_invites: {
+    profiles: { table: 'profiles', kind: 'one', col: 'invited_by' },
+  },
+  locations: {
+    organizations: { table: 'organizations', kind: 'one', col: 'organization_id' },
+  },
+  staff: {
+    locations: { table: 'locations', kind: 'one', col: 'location_id' },
+  },
+};
+
+// parseSelect("*, customers (id, name), order_items (*)") →
+//   { base: '*', joins: [ {name:'customers', relation:'customers', hint:null, cols:'id,name'}, ... ] }
+//
+// Whitespace tolerant. Doesn't handle deeper than one level; nested parens
+// inside a join become that join's scalar cols. Good enough for current usage.
+//
+// Also accepts PostgREST/supabase-js's aliased embed syntax, since several
+// call sites use it: `alias:relation (cols)` and `alias:relation!fkeyHint
+// (cols)` (e.g. `child_item:child_item_id (...)`, where the part after ':' is
+// actually the FK *column* name, not a relation; or
+// `child_item:items!item_recipes_child_item_id_fkey (...)`). `name` is what
+// the resolved data gets attached to the row as; `relation` and `hint` are
+// candidates resolveEmbeds() matches against FK[] — neither is assumed to be
+// a literal table name on its own, since PostgREST allows either position to
+// carry the disambiguating FK column/constraint instead.
+interface Join {
+  name: string;
+  relation: string;
+  hint: string | null;
+  cols: string;
+}
+
+interface ParsedSelect {
+  base: string;
+  joins: Join[];
+}
+
+function parseSelect(raw: string | null | undefined): ParsedSelect {
+  if (!raw || !/\(/.test(raw)) return { base: raw || '*', joins: [] };
+  const normalized = raw.replace(/\s+/g, ' ').trim();
+  const joins: Join[] = [];
+  const base: string[] = [];
+  let i = 0;
+  while (i < normalized.length) {
+    // skip leading whitespace + commas
+    while (i < normalized.length && /[\s,]/.test(normalized[i])) i++;
+    if (i >= normalized.length) break;
+    // read identifier up to ',' or '('
+    let j = i;
+    while (j < normalized.length && !/[,()]/.test(normalized[j])) j++;
+    const token = normalized.slice(i, j).trim();
+    if (normalized[j] === '(') {
+      // embedded join
+      let depth = 1;
+      let k = j + 1;
+      while (k < normalized.length && depth > 0) {
+        if (normalized[k] === '(') depth++;
+        else if (normalized[k] === ')') depth--;
+        if (depth === 0) break;
+        k++;
+      }
+      const cols = normalized.slice(j + 1, k).replace(/\s+/g, '').replace(/,+$/, '');
+      if (token) {
+        const colonIdx = token.indexOf(':');
+        const alias = colonIdx === -1 ? null : token.slice(0, colonIdx).trim();
+        const target = colonIdx === -1 ? token : token.slice(colonIdx + 1).trim();
+        const bangIdx = target.indexOf('!');
+        const relation = bangIdx === -1 ? target : target.slice(0, bangIdx).trim();
+        const hint = bangIdx === -1 ? null : target.slice(bangIdx + 1).trim();
+        joins.push({ name: alias || relation, relation, hint, cols: cols || '*' });
+      }
+      i = k + 1;
+    } else {
+      if (token) base.push(token);
+      i = j;
+    }
+  }
+  return { base: base.length ? base.join(',') : '*', joins };
+}
+
+// Match a parsed join against the FK map for its parent table. Tries, in
+// order: the relation name itself (the common case, `profiles (...)` or
+// `profiles!some_fkey (...)`); the relation as an FK *column* name instead
+// (supabase-js's `alias:fk_column (...)` shorthand); then the hint (after
+// '!') as either an FK column or a literal table name, for constraint-name
+// hints that don't match any of the above.
+function findEdge(map: Record<string, FKEdge>, j: Join): FKEdge | null {
+  if (map[j.relation]) return map[j.relation];
+  for (const edge of Object.values(map)) {
+    if (edge.col === j.relation) return edge;
+    if (j.hint && (edge.col === j.hint || edge.table === j.hint)) return edge;
+  }
+  return null;
+}
+
+// Rows are opaque records keyed by column name — the shape varies by table
+// and is not modeled here (mirrors the untyped rows the old supabase-js
+// client returned).
+type Row = Record<string, unknown>;
+
+async function resolveEmbeds(parentTable: string, rows: Row[], joins: Join[]): Promise<Row[]> {
+  if (!joins.length || !rows.length) return rows;
+  const map = FK[parentTable] || {};
+  for (const j of joins) {
+    const edge = findEdge(map, j);
+    if (!edge) {
+      for (const r of rows) r[j.name] = null;
+      continue;
+    }
+    if (edge.kind === 'one') {
+      const ids = [...new Set(rows.map(r => r[edge.col]).filter(v => v != null))];
+      if (!ids.length) { for (const r of rows) r[j.name] = null; continue; }
+      const qs = new URLSearchParams();
+      qs.append('in', ['id', ...ids].join(','));
+      if (j.cols && j.cols !== '*') qs.set('select', j.cols);
+      const res = await request<Row[]>('GET', `/data/${edge.table}?${qs.toString()}`);
+      const byId = new Map((res.data || []).map(r => [r.id, r]));
+      for (const r of rows) r[j.name] = byId.get(r[edge.col]) || null;
+    } else {
+      const ids = [...new Set(rows.map(r => r.id).filter(v => v != null))];
+      if (!ids.length) { for (const r of rows) r[j.name] = []; continue; }
+      const qs = new URLSearchParams();
+      qs.append('in', [edge.col, ...ids].join(','));
+      if (j.cols && j.cols !== '*') qs.set('select', j.cols);
+      const res = await request<Row[]>('GET', `/data/${edge.table}?${qs.toString()}`);
+      const grouped = new Map<unknown, Row[]>();
+      for (const child of res.data || []) {
+        const k = child[edge.col];
+        if (!grouped.has(k)) grouped.set(k, []);
+        grouped.get(k)!.push(child);
+      }
+      for (const r of rows) r[j.name] = grouped.get(r.id) || [];
+    }
+  }
+  return rows;
+}
+
+// ---- query builder (matches supabase.from(...)) ----
+//
+// Supported:
+//   .select(cols?).eq(col,val).neq/.gt/.gte/.lt/.lte/.like/.ilike/.in(col,[…])
+//   .is(col, null|true|false)
+//   .order(col, { ascending })
+//   .limit(n)
+//   .single() / .maybeSingle()
+//   .insert(row|rows[]).select()
+//   .update(changes).eq(...).select()
+//   .delete().eq(...)
+//   .upsert(row|rows[]) — (mapped to insert for now; add when needed)
+
+type FilterOp = 'eq' | 'neq' | 'gt' | 'gte' | 'lt' | 'lte' | 'like' | 'ilike' | 'in' | 'is';
+
+interface Filter {
+  op: FilterOp;
+  col: string;
+  val: unknown;
+}
+
+interface Order {
+  col: string;
+  asc: boolean;
+}
+
+type BuilderMode = 'select' | 'insert' | 'update' | 'delete';
+
+class Builder {
+  _table: string;
+  _mode: BuilderMode;
+  _cols: string;
+  _filters: Filter[];
+  _orders: Order[];
+  _limit: number | null;
+  _body: unknown;
+  _returning: boolean;
+  _single: boolean;
+  _maybeSingle: boolean;
+
+  constructor(table: string) {
+    this._table = table;
+    this._mode = 'select';
+    this._cols = '*';
+    this._filters = []; // {op, col, val}
+    this._orders = [];  // {col, asc}
+    this._limit = null;
+    this._body = null;
+    this._returning = false;
+    this._single = false;
+    this._maybeSingle = false;
+  }
+
+  select(cols?: string) {
+    this._cols = cols || '*';
+    if (this._mode === 'insert' || this._mode === 'update') {
+      // keep current mode; mark that we want the rows back.
+      this._returning = true;
+    } else {
+      this._mode = 'select';
+    }
+    return this;
+  }
+
+  insert(rows: unknown) {
+    this._mode = 'insert';
+    this._body = rows;
+    return this;
+  }
+  upsert(rows: unknown) {
+    // Fallback: behave like insert. Extend when unique-conflict needed.
+    this._mode = 'insert';
+    this._body = rows;
+    return this;
+  }
+  update(changes: unknown) {
+    this._mode = 'update';
+    this._body = changes;
+    return this;
+  }
+  delete() {
+    this._mode = 'delete';
+    return this;
+  }
+
+  // -- filters --
+  eq(col: string, v: unknown)    { this._filters.push({ op: 'eq', col, val: v }); return this; }
+  neq(col: string, v: unknown)   { this._filters.push({ op: 'neq', col, val: v }); return this; }
+  gt(col: string, v: unknown)    { this._filters.push({ op: 'gt', col, val: v }); return this; }
+  gte(col: string, v: unknown)   { this._filters.push({ op: 'gte', col, val: v }); return this; }
+  lt(col: string, v: unknown)    { this._filters.push({ op: 'lt', col, val: v }); return this; }
+  lte(col: string, v: unknown)   { this._filters.push({ op: 'lte', col, val: v }); return this; }
+  like(col: string, v: unknown)  { this._filters.push({ op: 'like', col, val: v }); return this; }
+  ilike(col: string, v: unknown) { this._filters.push({ op: 'ilike', col, val: v }); return this; }
+  in(col: string, arr: unknown[])  { this._filters.push({ op: 'in', col, val: arr }); return this; }
+  is(col: string, v: unknown) {
+    let s;
+    if (v === null) s = 'null';
+    else if (v === true) s = 'true';
+    else if (v === false) s = 'false';
+    else s = String(v);
+    this._filters.push({ op: 'is', col, val: s });
+    return this;
+  }
+
+  order(col: string, { ascending = true }: { ascending?: boolean } = {}) {
+    this._orders.push({ col, asc: ascending });
+    return this;
+  }
+  limit(n: number) { this._limit = n; return this; }
+
+  single() { this._single = true; return this; }
+  maybeSingle() { this._maybeSingle = true; return this; }
+
+  _qs(extra: { baseCols?: string; single?: boolean } = {}) {
+    const params = new URLSearchParams();
+    for (const f of this._filters) {
+      if (f.op === 'in') {
+        params.append('in', [f.col, ...(f.val as unknown[])].join(','));
+      } else if (f.op === 'is') {
+        params.append('is', `${f.col},${f.val}`);
+      } else {
+        params.append(f.op, `${f.col},${serialize(f.val)}`);
+      }
+    }
+    for (const o of this._orders) {
+      params.append('order', `${o.col}.${o.asc ? 'asc' : 'desc'}`);
+    }
+    if (this._limit != null) params.set('limit', String(this._limit));
+    if (extra.baseCols && extra.baseCols !== '*' && this._mode === 'select') {
+      params.set('select', extra.baseCols);
+    }
+    if (extra.single) params.set('single', 'true');
+    const s = params.toString();
+    return s ? `?${s}` : '';
+  }
+
+  // Builder is untyped over its result shape by design: it mimics the old
+  // supabase-js query builder across arbitrary tables (.from('any_table')),
+  // and .select()/.eq()/.order() etc. all return `this` rather than a
+  // narrowed type, so there's no call-site generic to thread the result
+  // type through without a structural rewrite of the fluent chain. Callers
+  // that want a typed result cast the returned `data` themselves (see
+  // services/*.ts). `any` here (not `unknown`) is intentional: `unknown`
+  // would force a cast at every one of the ~40 call sites for no added
+  // safety, since none of them are narrowed today.
+  async _run(): Promise<ApiResult<any>> {
+    const path = `/data/${encodeURIComponent(this._table)}`;
+    switch (this._mode) {
+      case 'select': {
+        const parsed = parseSelect(this._cols);
+        // Force multi-row fetch so we can resolve embeds, then unwrap to single.
+        const wantSingle = this._single;
+        const qs = this._qs({ baseCols: parsed.base, single: wantSingle && !parsed.joins.length });
+        const res = await request<Row | Row[]>('GET', `${path}${qs}`);
+        const { data, error } = res;
+        if (error) {
+          if (this._maybeSingle && error.status === 404) return { data: null, error: null };
+          return { data: null, error };
+        }
+        if (parsed.joins.length) {
+          const rows = Array.isArray(data) ? data : (data ? [data] : []);
+          await resolveEmbeds(this._table, rows, parsed.joins);
+          if (wantSingle) return { data: rows[0] || null, error: null };
+          if (this._maybeSingle) return { data: rows[0] || null, error: null };
+          return { data: rows, error: null };
+        }
+        if (this._maybeSingle) {
+          if (Array.isArray(data)) return { data: data[0] || null, error: null };
+          return { data, error: null };
+        }
+        return { data, error: null };
+      }
+      case 'insert': {
+        const { data, error } = await request<Row | Row[]>('POST', path, { body: this._body });
+        if (error) return { data, error };
+        if (this._single) return { data: Array.isArray(data) ? data[0] : data, error: null };
+        return { data, error: null };
+      }
+      case 'update': {
+        const parsed = parseSelect(this._cols);
+        const qs = this._qs({ baseCols: parsed.base, single: this._single && !parsed.joins.length });
+        const { data, error } = await request<Row | Row[]>('PATCH', `${path}${qs}`, { body: this._body });
+        if (error) return { data, error };
+        if (this._single) return { data: Array.isArray(data) ? data[0] : data, error: null };
+        return { data, error: null };
+      }
+      case 'delete': {
+        const qs = this._qs();
+        return request('DELETE', `${path}${qs}`);
+      }
+    }
+  }
+
+  then<TResult1 = ApiResult<any>, TResult2 = never>(
+    onF?: ((value: ApiResult<any>) => TResult1 | PromiseLike<TResult1>) | null,
+    onR?: ((reason: unknown) => TResult2 | PromiseLike<TResult2>) | null,
+  ) { return this._run().then(onF, onR); }
+  catch(onR: (reason: unknown) => any)     { return this._run().catch(onR); }
+  finally(onF: () => void)   { return this._run().finally(onF); }
+}
+
+function serialize(v: unknown): string {
+  if (v === null || v === undefined) return '';
+  if (typeof v === 'object') return JSON.stringify(v);
+  return String(v);
+}
+
+function from(table: string) { return new Builder(table); }
+
+async function rpc<T = unknown>(fn: string, args: unknown = {}) {
+  return request<T>('POST', `/rpc/${encodeURIComponent(fn)}`, { body: args });
+}
+
+// ---- edge-function-style invoke (matches supabase.functions.invoke) ----
+
+async function invokeFunction(name: string, { body }: { body?: unknown } = {}) {
+  // Map supabase function names → our Go endpoints.
+  const route = ({
+    'chatbot-whatsapp-send': '/chatbot/whatsapp/send',
+  } as Record<string, string>)[name];
+  if (!route) return { data: null, error: { message: `unknown function ${name}` } };
+  return request('POST', route, { body });
+}
+
+// ---- exported client ----
+
+export const supabase = {
+  from,
+  rpc,
+  auth,
+  functions: { invoke: invokeFunction },
+};
+
+// Raw helpers for code that wants to hit the REST layer directly.
+export const api = { request, auth, from, rpc };
+
+// Backwards-compat default export so `import supabase from ...` keeps working.
+export default supabase;

@@ -1,0 +1,603 @@
+import { useState, useEffect } from 'react';
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Badge } from "@/components/ui/badge";
+import { Input } from "@/components/ui/input";
+import { Button } from "@/components/ui/button";
+import { StatCard } from "@/components/ui/stat-card";
+import { Calculator, DollarSign, TrendingUp, TrendingDown, AlertTriangle, CheckCircle, Search, BarChart3, PieChart, Target, Package, ChefHat, Utensils, ArrowUpRight, ArrowDownRight, Minus, Info, RefreshCw } from 'lucide-react';
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
+import { Progress } from "@/components/ui/progress";
+import { Switch } from "@/components/ui/switch";
+import { Label } from "@/components/ui/label";
+import { useMoney } from '@/context/locale-context';
+import { supabase } from '@/services/supabase-client';
+import { cn } from "@/lib/utils";
+import type { Location } from '@/context/auth-context';
+
+// Mirrors backend/migrations/001_baseline.sql `items` table (subset), plus the
+// fields this page computes locally (calculated_cost/cost_variance/profit_*/status).
+//
+// NOTE (real defect found by this TS conversion, not fixed — out of scope):
+// fetchAnalysisData's primary path below queries a `recipe_summary` view that
+// does not exist in any migration file — it's only referenced by
+// backend/internal/handlers/data/allowlist.go (marked "// view" but never
+// created by a migration). That query always throws, so this component
+// always falls through to fetchAnalysisDataFallback, which is the only path
+// that ever actually runs. This type mirrors that fallback's real shape
+// rather than the unreachable primary path's assumed one.
+interface AnalysisCategoryRef {
+  id: string;
+  name: string;
+}
+
+interface AnalysisRow {
+  id: string;
+  name: string;
+  price: number;
+  cost_price?: number | null;
+  recipe_type: string;
+  recipe_complexity: string;
+  max_recipe_level: number;
+  total_components: number;
+  auto_calculate_cost: boolean;
+  categories?: AnalysisCategoryRef | null;
+  listed_cost?: number | null;
+  calculated_cost: number;
+  cost_variance: number;
+  profit_margin: number;
+  profit_amount: number;
+  status: string;
+}
+
+type SortKey = 'profit_margin' | 'profit_amount' | 'cost_variance' | 'listed_cost' | 'calculated_cost' | 'name';
+
+// Shape assumed by the dead `recipe_summary` primary path below — unverifiable
+// since the view itself doesn't exist (see the NOTE above); typed to the
+// minimum this file actually reads from it.
+interface RecipeSummaryDeadRow {
+  listed_cost?: number | null;
+  calculated_cost?: number | null;
+  cost_variance: number;
+  [key: string]: unknown;
+}
+
+interface CostAnalysisProps {
+  activeLocation: Location | null;
+}
+
+const CostAnalysis = ({ activeLocation }: CostAnalysisProps) => {
+  const { format: formatMoneyValue, scale: currencyScaleValue } = useMoney();
+  const [analysisData, setAnalysisData] = useState<AnalysisRow[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [searchTerm, setSearchTerm] = useState('');
+  const [sortBy, setSortBy] = useState<SortKey>('profit_margin');
+  const [sortOrder, setSortOrder] = useState('desc');
+  const [showOnlyProblematic, setShowOnlyProblematic] = useState(false);
+  const [costThreshold, setCostThreshold] = useState(1.00);
+
+  useEffect(() => {
+    if (activeLocation) {
+      // fetchAnalysisData() is fully try/catch/finally-wrapped below.
+      void fetchAnalysisData();
+    }
+  }, [activeLocation]);
+
+  const fetchAnalysisData = async () => {
+    if (!activeLocation) return;
+    
+    setLoading(true);
+    try {
+      // Try to use the recipe_summary view first
+      const { data: summaryData, error: summaryError } = await supabase
+        .from('recipe_summary')
+        .select('*')
+        .order('recipe_complexity', { ascending: false })
+        .order('cost_variance', { ascending: false });
+      
+      if (summaryError) throw summaryError;
+      
+      // Enhance with additional calculations
+      const enhancedData = summaryData.map((item: RecipeSummaryDeadRow) => {
+        const profitMargin = (item.listed_cost || 0) > 0
+          ? (((item.listed_cost || 0) - (item.calculated_cost || 0)) / (item.listed_cost || 0) * 100)
+          : 0;
+        
+        const profitAmount = (item.listed_cost || 0) - (item.calculated_cost || 0);
+        
+        const status = determineStatus(item, profitMargin);
+        
+        return {
+          ...item,
+          profit_margin: profitMargin,
+          profit_amount: profitAmount,
+          status
+        };
+      });
+      
+      setAnalysisData(enhancedData);
+    } catch (error) {
+      console.error('Error fetching analysis data:', error);
+      // Fallback to manual calculation
+      await fetchAnalysisDataFallback();
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const fetchAnalysisDataFallback = async () => {
+    if (!activeLocation) return;
+
+    try {
+      const { data: items, error } = await supabase
+        .from('items')
+        .select(`
+          id,
+          name,
+          price,
+          cost_price,
+          recipe_type,
+          recipe_complexity,
+          max_recipe_level,
+          total_components,
+          auto_calculate_cost,
+          categories (
+            id,
+            name
+          )
+        `)
+        .eq('location_id', activeLocation.id)
+        .neq('recipe_type', 'simple');
+
+      if (error) throw error;
+
+      // Calculate costs manually for items that need it
+      const enhancedData = await Promise.all(
+        items.map(async (item: {
+          id: string;
+          name: string;
+          price: number;
+          cost_price?: number | null;
+          recipe_type: string;
+          recipe_complexity: string;
+          max_recipe_level: number;
+          total_components: number;
+          auto_calculate_cost: boolean;
+          categories?: AnalysisCategoryRef | null;
+        }) => {
+          let calculatedCost = item.cost_price || 0;
+
+          if (item.recipe_type !== 'simple') {
+            try {
+              const { data: costData } = await supabase.rpc<number>('calculate_recipe_cost', {
+                item_uuid: item.id
+              });
+              calculatedCost = costData || 0;
+            } catch (_costError) {
+              console.warn('Failed to calculate cost for', item.name);
+            }
+          }
+
+          const profitMargin = item.price > 0
+            ? ((item.price - calculatedCost) / item.price * 100)
+            : 0;
+          
+          const profitAmount = (item.price || 0) - calculatedCost;
+          const costVariance = Math.abs((item.cost_price || 0) - calculatedCost);
+          
+          const status = determineStatus({ cost_variance: costVariance }, profitMargin);
+          
+          return {
+            ...item,
+            listed_cost: item.cost_price,
+            calculated_cost: calculatedCost,
+            cost_variance: costVariance,
+            profit_margin: profitMargin,
+            profit_amount: profitAmount,
+            status
+          };
+        })
+      );
+      
+      setAnalysisData(enhancedData);
+    } catch (error) {
+      console.error('Error in fallback analysis fetch:', error);
+    }
+  };
+
+  const determineStatus = (item: { cost_variance: number }, profitMargin: number): string => {
+    if (item.cost_variance > costThreshold) return 'cost_mismatch';
+    if (profitMargin < 10) return 'low_profit';
+    if (profitMargin < 25) return 'moderate_profit';
+    if (profitMargin >= 50) return 'high_profit';
+    return 'good_profit';
+  };
+
+  // Maps the 5 analysis buckets onto the 3 status tokens an owner actually needs
+  // to triage at a glance: destructive = losing money, warning = worth a second
+  // look (thin margin, or manual/calculated cost disagree), success = healthy.
+  // Thresholds themselves are untouched — this only retargets the colour.
+  const getStatusInfo = (status: string): {
+    label: string;
+    variant: 'warning' | 'destructive' | 'success' | 'outline';
+    icon: typeof AlertTriangle;
+    description: string;
+  } => {
+    switch (status) {
+      case 'cost_mismatch':
+        return {
+          label: 'Cost Mismatch',
+          variant: 'warning',
+          icon: AlertTriangle,
+          description: 'Manual and calculated costs differ significantly'
+        };
+      case 'low_profit':
+        return {
+          label: 'Low Profit',
+          variant: 'destructive',
+          icon: TrendingDown,
+          description: 'Profit margin below 10%'
+        };
+      case 'moderate_profit':
+        return {
+          label: 'Moderate Profit',
+          variant: 'warning',
+          icon: Minus,
+          description: 'Profit margin 10-25%'
+        };
+      case 'good_profit':
+        return {
+          label: 'Good Profit',
+          variant: 'success',
+          icon: CheckCircle,
+          description: 'Profit margin 25-50%'
+        };
+      case 'high_profit':
+        return {
+          label: 'High Profit',
+          variant: 'success',
+          icon: TrendingUp,
+          description: 'Profit margin above 50%'
+        };
+      default:
+        return {
+          label: 'Unknown',
+          variant: 'outline',
+          icon: Info,
+          description: 'Status unknown'
+        };
+    }
+  };
+
+  // Analysis amounts are major-unit floats, so scale up to minor units before
+  // handing them to the minor-unit-based formatter.
+  const formatCurrency = (amount?: number | null) => {
+    return formatMoneyValue(Math.round((amount || 0) * currencyScaleValue));
+  };
+
+  const formatPercentage = (value: number) => {
+    return `${value.toFixed(1)}%`;
+  };
+
+  const getItemTypeIcon = (type?: string) => {
+    switch (type) {
+      case 'recipe': return <ChefHat className="h-4 w-4" />;
+      case 'component': return <Package className="h-4 w-4" />;
+      default: return <Utensils className="h-4 w-4" />;
+    }
+  };
+
+  // Filter and sort data
+  const filteredData = analysisData
+    .filter(item => {
+      const matchesSearch = !searchTerm || 
+        item.name.toLowerCase().includes(searchTerm.toLowerCase());
+      
+      const matchesProblematic = !showOnlyProblematic || 
+        ['cost_mismatch', 'low_profit'].includes(item.status);
+      
+      return matchesSearch && matchesProblematic;
+    })
+    .sort((a, b) => {
+      const aVal = a[sortBy] || 0;
+      const bVal = b[sortBy] || 0;
+      
+      if (sortOrder === 'asc') {
+        return aVal > bVal ? 1 : -1;
+      } else {
+        return aVal < bVal ? 1 : -1;
+      }
+    });
+
+  // Calculate summary statistics
+  const totalItems = filteredData.length;
+  const avgProfitMargin = totalItems > 0 
+    ? filteredData.reduce((sum, item) => sum + item.profit_margin, 0) / totalItems 
+    : 0;
+  const totalProfit = filteredData.reduce((sum, item) => sum + item.profit_amount, 0);
+  const problematicItems = filteredData.filter(item => 
+    ['cost_mismatch', 'low_profit'].includes(item.status)
+  ).length;
+
+  if (!activeLocation) {
+    return (
+      <div className="flex items-center justify-center h-64">
+        <div className="text-center">
+          <Calculator className="h-8 w-8 text-muted-foreground mx-auto mb-4" />
+          <p className="text-muted-foreground">Please select a location to view cost analysis</p>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-6">
+      {/* Summary Cards — shared StatCard building block instead of hand-rolled
+          Card+icon markup, so this page's KPIs match every other stat row in
+          the app. "Needs Attention" gets a warning-tinted icon chip (via
+          iconClassName) since it's a count of problems, not a positive metric. */}
+      <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+        <StatCard
+          label="Avg Profit Margin"
+          value={<span className="tabular-nums">{formatPercentage(avgProfitMargin)}</span>}
+          icon={Target}
+        />
+        <StatCard
+          label="Total Profit"
+          value={<span className="tabular-nums">{formatCurrency(totalProfit)}</span>}
+          icon={DollarSign}
+        />
+        <StatCard
+          label="Items Analyzed"
+          value={<span className="tabular-nums">{totalItems}</span>}
+          icon={BarChart3}
+        />
+        <StatCard
+          label="Needs Attention"
+          value={<span className="tabular-nums">{problematicItems}</span>}
+          icon={AlertTriangle}
+          iconClassName="bg-warning/10 text-warning ring-warning/20"
+        />
+      </div>
+
+      {/* Filters and Controls */}
+      <Card>
+        <CardContent className="p-4">
+          <div className="flex flex-col sm:flex-row gap-4 items-start sm:items-center">
+            <div className="relative flex-1">
+              <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 text-muted-foreground h-4 w-4" />
+              <Input
+                placeholder="Search items..."
+                value={searchTerm}
+                onChange={(e) => setSearchTerm(e.target.value)}
+                className="pl-10"
+              />
+            </div>
+            
+            <Select value={sortBy} onValueChange={(v) => setSortBy(v as SortKey)}>
+              <SelectTrigger className="w-full sm:w-48">
+                <SelectValue placeholder="Sort by..." />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="profit_margin">Profit Margin</SelectItem>
+                <SelectItem value="profit_amount">Profit Amount</SelectItem>
+                <SelectItem value="cost_variance">Cost Variance</SelectItem>
+                <SelectItem value="listed_cost">Listed Cost</SelectItem>
+                <SelectItem value="calculated_cost">Calculated Cost</SelectItem>
+                <SelectItem value="name">Name</SelectItem>
+              </SelectContent>
+            </Select>
+            
+            <Select value={sortOrder} onValueChange={setSortOrder}>
+              <SelectTrigger className="w-full sm:w-32">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="desc">Descending</SelectItem>
+                <SelectItem value="asc">Ascending</SelectItem>
+              </SelectContent>
+            </Select>
+            
+            <div className="flex items-center space-x-2">
+              <Switch
+                id="show-problematic"
+                checked={showOnlyProblematic}
+                onCheckedChange={setShowOnlyProblematic}
+              />
+              <Label htmlFor="show-problematic" className="text-sm">Problems only</Label>
+            </div>
+            
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={fetchAnalysisData}
+              disabled={loading}
+              className="flex items-center gap-2"
+            >
+              <RefreshCw className={cn("h-4 w-4", loading && "animate-spin")} />
+              Refresh
+            </Button>
+          </div>
+        </CardContent>
+      </Card>
+
+      {/* Analysis Table */}
+      <Card>
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2">
+            <Calculator className="h-5 w-5" />
+            Cost Analysis Details
+          </CardTitle>
+        </CardHeader>
+        <CardContent>
+          {loading ? (
+            <div className="flex items-center justify-center py-8">
+              <div className="animate-spin rounded-full h-6 w-6 border-b-2 border-primary mr-3"></div>
+              <span className="text-muted-foreground">Analyzing costs...</span>
+            </div>
+          ) : filteredData.length === 0 ? (
+            <div className="text-center py-12">
+              <Calculator className="h-12 w-12 text-muted-foreground mx-auto mb-4" />
+              <h3 className="text-lg font-medium text-foreground mb-2">No analysis data found</h3>
+              <p className="text-muted-foreground">
+                {analysisData.length === 0 
+                  ? 'No recipes found for analysis. Create some recipes first.'
+                  : 'No items match your current filters. Try adjusting your search criteria.'
+                }
+              </p>
+            </div>
+          ) : (
+            <div className="space-y-3">
+              {filteredData.map((item) => {
+                const statusInfo = getStatusInfo(item.status);
+                const StatusIcon = statusInfo.icon;
+                
+                return (
+                  <div
+                    key={item.id}
+                    className="flex items-center gap-4 p-4 border border-border rounded-lg hover:border-border transition-colors"
+                  >
+                    <div className="flex items-center gap-3 flex-1 min-w-0">
+                      {getItemTypeIcon(item.recipe_type)}
+                      <div className="flex-1 min-w-0">
+                        <div className="flex items-center gap-2 mb-1">
+                          <h4 className="font-semibold text-foreground truncate">{item.name}</h4>
+                          <Badge variant="outline">{item.recipe_type}</Badge>
+                          <TooltipProvider>
+                            <Tooltip>
+                              <TooltipTrigger asChild>
+                                <Badge variant={statusInfo.variant}>
+                                  <StatusIcon className="h-3 w-3 mr-1" />
+                                  {statusInfo.label}
+                                </Badge>
+                              </TooltipTrigger>
+                              <TooltipContent>
+                                <p>{statusInfo.description}</p>
+                              </TooltipContent>
+                            </Tooltip>
+                          </TooltipProvider>
+                        </div>
+                        
+                        <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 text-sm">
+                          <div>
+                            <p className="text-muted-foreground">Selling Price</p>
+                            <p className="font-semibold tabular-nums">{formatCurrency(item.price)}</p>
+                          </div>
+
+                          <div>
+                            <p className="text-muted-foreground">Cost (Manual)</p>
+                            <p className="font-semibold tabular-nums">{formatCurrency(item.listed_cost)}</p>
+                          </div>
+
+                          <div>
+                            <p className="text-muted-foreground">Cost (Calculated)</p>
+                            <p className="font-semibold tabular-nums">{formatCurrency(item.calculated_cost)}</p>
+                          </div>
+
+                          <div>
+                            <p className="text-muted-foreground">Profit Margin</p>
+                            <div className="flex items-center gap-2">
+                              <p className={cn(
+                                "font-semibold tabular-nums",
+                                item.profit_margin < 10 ? "text-destructive" :
+                                item.profit_margin < 25 ? "text-warning" :
+                                "text-success"
+                              )}>
+                                {formatPercentage(item.profit_margin)}
+                              </p>
+                              {item.profit_margin >= 0 ? (
+                                <ArrowUpRight className="h-3 w-3 text-success" />
+                              ) : (
+                                <ArrowDownRight className="h-3 w-3 text-destructive" />
+                              )}
+                            </div>
+                          </div>
+                        </div>
+
+                        {item.cost_variance > costThreshold && (
+                          <div className="mt-2 p-2 bg-warning/10 border border-warning/30 rounded-lg text-sm">
+                            <div className="flex items-center gap-2 text-warning">
+                              <AlertTriangle className="h-4 w-4" />
+                              <span className="font-medium">Cost Variance Alert</span>
+                            </div>
+                            <p className="text-warning mt-1 tabular-nums">
+                              Manual cost ({formatCurrency(item.listed_cost)}) differs from calculated cost
+                              ({formatCurrency(item.calculated_cost)}) by {formatCurrency(item.cost_variance)}
+                            </p>
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                    
+                    <div className="text-right">
+                      <div className={cn(
+                        "text-lg font-bold tabular-nums",
+                        item.profit_amount < 0 ? "text-destructive" : "text-foreground"
+                      )}>
+                        {formatCurrency(item.profit_amount)}
+                      </div>
+                      <div className="text-sm text-muted-foreground">profit</div>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </CardContent>
+      </Card>
+
+      {/* Profit Margin Distribution */}
+      {filteredData.length > 0 && (
+        <Card>
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2">
+              <PieChart className="h-5 w-5" />
+              Profit Margin Distribution
+            </CardTitle>
+          </CardHeader>
+          <CardContent>
+            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+              {Object.entries(
+                filteredData.reduce<Record<string, number>>((acc, item) => {
+                  const status = item.status;
+                  if (!acc[status]) acc[status] = 0;
+                  acc[status]++;
+                  return acc;
+                }, {})
+              ).map(([status, count]) => {
+                const statusInfo = getStatusInfo(status);
+                const StatusIcon = statusInfo.icon;
+                const percentage = (count / filteredData.length) * 100;
+                
+                return (
+                  <div key={status} className="text-center">
+                    <div className="flex items-center justify-center gap-2 mb-2">
+                      <StatusIcon className="h-4 w-4" />
+                      <span className="text-sm font-medium">{statusInfo.label}</span>
+                    </div>
+                    <div className="text-2xl font-bold mb-1 tabular-nums">{count}</div>
+                    <Progress value={percentage} className="h-2 mb-1" />
+                    <div className="text-xs text-muted-foreground tabular-nums">{formatPercentage(percentage)}</div>
+                  </div>
+                );
+              })}
+            </div>
+          </CardContent>
+        </Card>
+      )}
+    </div>
+  );
+};
+
+export default CostAnalysis; 

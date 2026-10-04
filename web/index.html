@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="es-MX">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    
+    <!-- SEO Meta Tags -->
+    <title>Itako | Administración de taquería</title>
+    <meta name="description" content="Itako: sistema local para controlar órdenes, inventario, gastos y ventas de tu taquería." />
+    <meta name="keywords" content="Itako, taquería, ventas, inventario, gastos, órdenes, MXN" />
+    <meta name="author" content="Itako" />
+    <meta name="robots" content="index, follow" />
+
+    <!--
+      No canonical or absolute og:url here on purpose. This is the app shell
+      of a self-hosted product: every deployment lives on the operator's own
+      hostname, so a canonical pointing at one domain would tell crawlers that
+      every restaurant's till belongs to somebody else's site. (It used to
+      point at beepbite.io, which nobody operates.) The marketing page that
+      *does* have a canonical home is site/index.html.
+    -->
+
+    <!-- Favicons -->
+    <link rel="icon" type="image/svg+xml" href="/icon.svg" />
+    <link rel="apple-touch-icon" href="/icon.png" />
+
+    <!-- Open Graph / Facebook — relative image, host-agnostic -->
+    <meta property="og:type" content="website" />
+    <meta property="og:title" content="Itako | Administración de taquería" />
+    <meta property="og:description" content="Órdenes, inventario, gastos y ventas de Itako en tu propio equipo y base de datos." />
+    <meta property="og:image" content="/icon.png" />
+    <meta property="og:site_name" content="Itako" />
+
+    <!-- Twitter -->
+    <meta property="twitter:card" content="summary_large_image" />
+    <meta property="twitter:title" content="Itako | Administración de taquería" />
+    <meta property="twitter:description" content="Órdenes, inventario, gastos y ventas de Itako en tu propio equipo y base de datos." />
+    <meta property="twitter:image" content="/icon.png" />
+
+    <!-- Additional SEO -->
+    <meta name="theme-color" content="#B91C1C" />
+    <meta name="application-name" content="Itako" />
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
